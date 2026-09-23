@@ -1,0 +1,12 @@
+Package: swarm-terminal
+Version: 0.1.14
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: SWARM local build <noreply@localhost>
+Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-3.0, gir1.2-vte-2.91 (>= 0.68)
+Description: Native terminal workspace for Codex CLI agents
+ SWARM opens an interactive shell in a GTK terminal workspace and manages
+ Codex CLI sessions in tabs. Broadcast messages to active agent sessions
+ in the current window.
+ The Codex CLI is installed separately.

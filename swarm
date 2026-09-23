@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+SWARM_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export PYTHONPATH="$SWARM_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m swarm_app "$@"

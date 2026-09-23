@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SWARM
+Comment=Manage Codex agents in a terminal workspace
+Exec=swarm
+Icon=swarm-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=Codex;Agent;Terminal;
+StartupNotify=true
