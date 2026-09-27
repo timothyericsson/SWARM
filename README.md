@@ -33,7 +33,9 @@ Use `cd` normally, then choose **Swarm > New Agent**. It runs `codex --yolo` in 
 
 Interactive Codex launched in a shell is detected automatically, including `resume` and `fork`. Its tab becomes an agent while Codex is in the foreground. Returning to the shell, suspending it, or moving it to the background removes it from broadcasts. Background processes and noninteractive commands such as `login`, `exec`, and `app-server` are excluded.
 
-The tab spinner runs while an agent is working. Agents opened through **New Agent** move to the far left when they become idle, newest first, without changing your selected tab. You can still drag tabs around; an agent moves automatically again only when it next becomes ready.
+The tab spinner runs while an agent is working. The bottom-left status shows the agent total and how many are currently working, for example **4 agents · 2 running**. The running count follows the tab spinners. Agents opened through **New Agent** move to the far left when they become idle, newest first, without changing your selected tab. You can still drag tabs around; an agent moves automatically again only when it next becomes ready.
+
+**Swarm > Kill All Agents** stops and closes all agent tabs in the current window, including exited agents. If any agents are still working, a warning shows how many and lets you cancel. Shell and sign-in tabs stay open.
 
 ## Broadcasts
 
@@ -44,6 +46,8 @@ All broadcasts submit through terminal input. Finish CLI onboarding and leave pr
 | Global Broadcast | All running agents in this window, including detected manual sessions. |
 | Sleeper Broadcast | Agents opened through New Agent that are ready when you send. Busy agents, approval prompts, and unavailable status are skipped. |
 | Custom Broadcast | Only the running agents you select, including selected busy or manual sessions. |
+
+Global Broadcast offers **Notify me when these agents finish**, off by default. It works with agents opened through **New Agent**, **Ctrl+Shift+T**, and Codex launched manually in a terminal. It sends one desktop notification after all recipients have shown working activity and become idle. The alert follows each agent's activity indicator; an agent that never reports activity cannot signal completion. Closing or replacing a recipient, a failed delivery, or another broadcast to any of those agents cancels the pending alert. Notification display follows your desktop settings.
 
 Custom Broadcast shows agent names, folders, and current activity. Use **Select all**, **Select idle**, or **Clear selection**. Selection is remembered until the window closes; new or restarted agents start unselected. **Select idle** takes a snapshot when clicked. Sleeper Broadcast checks readiness again during delivery.
 
@@ -102,6 +106,7 @@ Building needs no root access. Remove the package with `sudo apt remove swarm-te
 - `session.py`: terminal sessions and message delivery.
 - `activity.py` and `codex_detection.py`: activity and foreground process detection.
 - `custom_broadcast.py`: recipient picker; `usage.py`: account usage queries.
+- `notifications.py`: desktop completion alerts.
 - `scripts/` and `packaging/`: installation and Debian packaging.
 - `tests/`: terminal fixtures and tests.
 

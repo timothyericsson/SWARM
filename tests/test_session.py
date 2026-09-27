@@ -2,6 +2,7 @@
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import shlex
 import tempfile
@@ -15,6 +16,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk
 
 from swarm_app.session import MAX_MESSAGE_BYTES, TerminalSession, normalize_message
+from swarm_app.codex_detection import DetectedCodex
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "fake_agent.py"
@@ -139,6 +141,60 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(session.broadcast("never send before the TUI", results.append))
         self.assertEqual(results, [False])
         self.assertEqual((directory / "input").read_bytes(), b"")
+
+    def test_agent_identity_is_independent_of_raw_input(self):
+        session, directory = self.new_session(mode="canonical")
+        self.ready(session, directory)
+        process = session._process
+        self.assertEqual(session.agent_identity, (process.pid, process.start, process.group))
+        self.assertIsNone(session.broadcast_identity)
+
+    def test_agent_identity_rejects_inactive_replaced_and_closed_processes(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        process = session._process
+        for state in ("Z", "X", "x", "T", "t"):
+            with self.subTest(state=state), patch("swarm_app.session._read_process",
+                                                return_value=replace(process, state=state)):
+                self.assertIsNone(session.agent_identity)
+        with patch("swarm_app.session._read_process", return_value=replace(process, start=process.start + 1)):
+            self.assertIsNone(session.agent_identity)
+        with patch("swarm_app.session._read_process", return_value=None):
+            self.assertIsNone(session.agent_identity)
+        session.close()
+        self.assertIsNone(session.agent_identity)
+
+    def test_manual_completion_requires_original_foreground_agent(self):
+        session, directory = self.new_session(kind="shell")
+        self.ready(session, directory)
+        process = session._process
+        detected = DetectedCodex(process.pid, process.start, process.session, process.group, str(directory))
+        session.kind = "agent"
+        session._detected_codex = detected
+        session.terminal.feed(b"\x1b]0;Task | project\x07")
+        pump_until(lambda: session.terminal.get_window_title() == "Task | project")
+        with patch.object(session, "_foreground_codex", return_value=detected):
+            self.assertEqual(session.agent_identity, (process.pid, process.start, process.group))
+            self.assertTrue(session.activity_finished("⠋ Task | project"))
+            self.assertFalse(session.activity_finished("Task | project"))
+            self.assertFalse(session.agent_idle)
+            self.assertFalse(session.can_receive_sleeper_broadcast)
+        for current in (None, replace(detected, start=detected.start + 1)):
+            with self.subTest(current=current), patch.object(session, "_foreground_codex", return_value=current):
+                self.assertIsNone(session.agent_identity)
+                self.assertFalse(session.activity_finished("⠋ Task | project"))
+
+    def test_managed_completion_needs_live_ready_status(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        session.managed_activity_title = True
+        session.terminal.feed(b"\x1b]0;Ready\x07")
+        pump_until(lambda: session.terminal.get_window_title() == "Ready")
+        self.assertTrue(session.activity_finished("Working"))
+        with patch.object(session, "_read_activity", return_value=None):
+            self.assertFalse(session.activity_finished("Working"))
+        session.close()
+        self.assertFalse(session.activity_finished("Working"))
 
     def test_shell_rejects_broadcast_even_with_raw_input(self):
         session, directory = self.new_session(kind="shell")

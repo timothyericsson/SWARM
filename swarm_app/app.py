@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass, field
 import math
 import os
 import pwd
@@ -21,6 +22,7 @@ from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, Vte
 from . import __version__
 from .activity import codex_agent_command
 from .custom_broadcast import CustomBroadcastDialog
+from .notifications import notify_agents_finished
 from .session import TerminalSession, normalize_message
 from .usage import UsageUnavailable, fetch_usage
 
@@ -48,6 +50,20 @@ notebook > header > tabs > tab:checked { border-top: 2px solid #88c5ad; }
 .usage-badge.usage-unknown label { color: #a6adba; }
 .usage-badge.usage-low label { color: #ff6b6b; }
 """
+
+BROADCAST_READY_SECONDS = 1.0
+
+
+@dataclass(eq=False)
+class BroadcastCompletion:
+    # Bind each recipient to its original process, including agents launched
+    # manually inside a shell that can later host a different Codex process.
+    recipients: frozenset[TerminalSession]
+    identities: dict[TerminalSession, tuple[int, int, int]]
+    submitted: set[TerminalSession] = field(default_factory=set)
+    started: set[TerminalSession] = field(default_factory=set)
+    busy_titles: dict[TerminalSession, str | None] = field(default_factory=dict)
+    ready_since: float | None = None
 
 
 def color(value):
@@ -109,7 +125,7 @@ class BroadcastDialog(Gtk.Dialog):
                          modal=True, destroy_with_parent=True)
         self.owner = window
         self.idle_only = idle_only
-        self.set_default_size(560, 330)
+        self.set_default_size(560, 390)
         self.set_resizable(True)
         self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
@@ -135,6 +151,13 @@ class BroadcastDialog(Gtk.Dialog):
         scroll.set_shadow_type(Gtk.ShadowType.IN)
         scroll.add(self.editor)
         content.pack_start(scroll, True, True, 0)
+        self.notification_options = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.notify_checkbox = Gtk.CheckButton(label="Notify me when these agents finish")
+        self.notification_options.pack_start(self.notify_checkbox, False, False, 0)
+        self.notify_help = label("", "muted")
+        self.notify_help.set_line_wrap(True)
+        self.notification_options.pack_start(self.notify_help, False, False, 0)
+        content.pack_start(self.notification_options, False, False, 0)
         self.feedback = label("Ctrl+Enter to send · Enter for a new line", "muted")
         self.feedback.set_line_wrap(True)
         content.pack_start(self.feedback, False, False, 0)
@@ -143,8 +166,9 @@ class BroadcastDialog(Gtk.Dialog):
         self.connect("response", self._response)
         self.connect("destroy", self._destroyed)
         self.refresh_source = GLib.timeout_add(250, self._refresh)
-        self._refresh()
         self.show_all()
+        self.notification_options.set_no_show_all(True)
+        self._refresh()
         self.editor.grab_focus()
 
     def text(self):
@@ -160,7 +184,16 @@ class BroadcastDialog(Gtk.Dialog):
         self._refresh()
 
     def _refresh(self):
-        count = len(self.owner.ready_agents() if self.idle_only else self.owner.active_agents())
+        targets = self.owner.ready_agents() if self.idle_only else self.owner.active_agents()
+        count = len(targets)
+        can_notify = not self.idle_only and bool(targets)
+        self.notification_options.set_visible(not self.idle_only)
+        self.notify_checkbox.set_sensitive(can_notify)
+        if not can_notify:
+            self.notify_checkbox.set_active(False)
+        self.notify_help.set_text(
+            "One desktop notification when all recipients finish working." if can_notify else
+            "No agents can receive a broadcast yet.")
         recipients = f"{count} {'idle ' if self.idle_only else ''}agent{'s' if count != 1 else ''}"
         summary = f"Send immediately to {recipients} in this window."
         if self.idle_only:
@@ -194,8 +227,9 @@ class BroadcastDialog(Gtk.Dialog):
         if response == Gtk.ResponseType.OK:
             if not self.send_button.get_sensitive():
                 return
-            sent = (self.owner.broadcast(self.text(), idle_only=True) if self.idle_only
-                    else self.owner.broadcast(self.text()))
+            sent = self.owner.broadcast(
+                self.text(), idle_only=self.idle_only,
+                notify_when_done=not self.idle_only and self.notify_checkbox.get_active())
             if not sent:
                 self._refresh()
                 return
@@ -228,6 +262,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.broadcast_dialog = None
         self.custom_broadcast_dialog = None
         self.custom_selection = {}
+        self.broadcast_watches = []
         self.flash_source = 0
         self.last_states = {}
         self.usage_hover_source = 0
@@ -238,6 +273,9 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.set_default_size(1040, 690)
         self.set_size_request(560, 340)
         self.set_icon_name("swarm-terminal")
+        source_icon = Path(__file__).resolve().parent.parent / "assets" / "swarm-terminal.svg"
+        if source_icon.is_file():
+            self.set_icon_from_file(str(source_icon))
         self.header = self._title_bar()
         self.set_titlebar(self.header)
         self.connect("notify::title", lambda window, _param: self.header.set_title(window.get_title()))
@@ -488,6 +526,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.global_item = item(swarm, "_Global Broadcast…", self.open_broadcast, "<Primary><Shift>b")
         self.sleeper_item = item(swarm, "_Sleeper Broadcast…", self.open_sleeper_broadcast)
         self.custom_item = item(swarm, "_Custom Broadcast…", self.open_custom_broadcast)
+        separator(swarm)
+        self.kill_all_agents_item = item(swarm, "_Kill All Agents", self.kill_all_agents)
 
         actions = menu("_Actions")
         item(actions, "_Rename Agent…", self.rename_current)
@@ -715,6 +755,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if session is self.current():
             self.set_title(f"{session.title} — SWARM")
         self._update_status()
+        self._check_broadcast_notifications()
 
     def _move_newly_idle_agent(self, session):
         if not session.agent_idle:
@@ -811,15 +852,19 @@ class SwarmWindow(Gtk.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         self._refresh_detected_agents()
         self._sync_workspace_folder()
+        self._check_broadcast_notifications()
         return GLib.SOURCE_CONTINUE
 
     def _update_status(self):
         count = sum(session.kind == "agent" and session.state == "running" for session in self.sessions)
         if not self.flash_source:
-            self.status_label.set_text(f"{count} agent{'s' if count != 1 else ''}" if count else "No agents")
+            busy = sum(session.agent_busy for session in self.sessions)
+            self.status_label.set_text(
+                f"{count} agent{'s' if count != 1 else ''} · {busy} running" if count else "No agents")
         self.global_item.set_sensitive(count > 0)
         self.sleeper_item.set_sensitive(count > 0)
         self.custom_item.set_sensitive(count > 0)
+        self.kill_all_agents_item.set_sensitive(any(session.kind == "agent" for session in self.sessions))
         current = self.current()
         self._sync_workspace_folder()
         self.account_label.set_text(self.app.auth_status)
@@ -866,7 +911,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         else:
             self.broadcast_dialog = BroadcastDialog(self, idle_only=idle_only)
 
-    def broadcast(self, message, *, idle_only=False, recipients=None):
+    def broadcast(self, message, *, idle_only=False, recipients=None, notify_when_done=False):
         try:
             message = normalize_message(message)
         except ValueError as error:
@@ -886,14 +931,33 @@ class SwarmWindow(Gtk.ApplicationWindow):
                 self.flash("No idle agents ready to receive a message" if idle_only
                            else "No running agents in this window")
             return False
+        if notify_when_done and (idle_only or custom):
+            self.flash("Finish notifications are available in Global Broadcast")
+            return False
+        identities = {session: session.agent_identity for session in targets} if notify_when_done else {}
+        if any(identity is None for identity in identities.values()):
+            self.flash("Agent sessions changed. Please try the broadcast again.")
+            return False
         remaining = len(targets)
         requested = len(recipients) if custom else len(targets)
         delivered = 0
+        # New input supersedes a pending alert for any overlapping recipient.
+        self.broadcast_watches = [watch for watch in self.broadcast_watches
+                                  if watch.recipients.isdisjoint(targets)]
+        watch = None
+        if notify_when_done:
+            watch = BroadcastCompletion(frozenset(targets), identities)
+            self.broadcast_watches.append(watch)
 
-        def completed(success):
+        def completed(session, success):
             nonlocal remaining, delivered
             remaining -= 1
             delivered += bool(success)
+            if watch in self.broadcast_watches:
+                if success:
+                    watch.submitted.add(session)
+                else:
+                    self.broadcast_watches.remove(watch)
             if remaining == 0:
                 if delivered == requested:
                     name = "Custom broadcast" if custom else "Sleeper broadcast" if idle_only else "Broadcast"
@@ -901,20 +965,53 @@ class SwarmWindow(Gtk.ApplicationWindow):
                 else:
                     self.flash(f"Sent to {delivered} agents. Not submitted to {requested - delivered}; "
                                "review their inputs.")
+            self._check_broadcast_notifications()
 
         self.flash(f"Sending to {len(targets)} {'idle ' if idle_only else ''}agents…")
         accepted = False
         for session in targets:
             # The session reports both accepted and rejected sends through completed.
+            callback = lambda success, target=session: completed(target, success)
             if custom:
-                sent = session.broadcast(message, completed, idle_only=idle_only,
+                sent = session.broadcast(message, callback, idle_only=idle_only,
                                          expected_target=recipients[session])
                 accepted = sent or accepted
             elif idle_only:
-                session.broadcast(message, completed, idle_only=True)
+                session.broadcast(message, callback, idle_only=True)
+            elif notify_when_done:
+                session.broadcast(message, callback, expected_target=watch.identities[session])
             else:
-                session.broadcast(message, completed)
+                session.broadcast(message, callback)
         return accepted if custom else True
+
+    def _check_broadcast_notifications(self):
+        if self.closing:
+            return
+        now = time.monotonic()
+        for watch in list(self.broadcast_watches):
+            if any(session not in self.sessions or session.kind != "agent" or session.state != "running"
+                   or session.agent_identity != watch.identities[session]
+                   for session in watch.recipients):
+                self.broadcast_watches.remove(watch)
+                continue
+            for session in watch.submitted:
+                if session.agent_busy:
+                    watch.started.add(session)
+                    watch.busy_titles[session] = session.terminal.get_window_title()
+            if (watch.submitted != watch.recipients or watch.started != watch.recipients
+                    or not all(session.activity_finished(watch.busy_titles[session]) for session in watch.recipients)):
+                watch.ready_since = None
+                continue
+            if watch.ready_since is None:
+                watch.ready_since = now
+            # A brief Ready between queued turns should not trigger an alert.
+            if now - watch.ready_since < BROADCAST_READY_SECONDS:
+                continue
+            self.broadcast_watches.remove(watch)
+            count = len(watch.recipients)
+            self.flash(f"Broadcast finished: {count} agent{'s' if count != 1 else ''} ready")
+            notify_agents_finished(count, on_error=lambda _error: self.flash(
+                "Agents finished, but the desktop notification could not be shown"))
 
     def choose_folder(self):
         dialog = Gtk.FileChooserDialog(title="Open Terminal in Folder", transient_for=self,
@@ -967,6 +1064,27 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if self.current():
             self.close_session(self.current())
 
+    def kill_all_agents(self):
+        if self.closing:
+            return
+        self._refresh_detected_agents()
+        agents = [session for session in self.sessions if session.kind == "agent"]
+        busy = sum(session.agent_busy for session in agents)
+        if busy:
+            if not self.confirm("Kill all agents?",
+                                f"{busy} agent{' is' if busy == 1 else 's are'} still running. "
+                                f"This will stop their work and close all {len(agents)} "
+                                f"agent tab{'s' if len(agents) != 1 else ''} in this window.",
+                                "Kill All Agents"):
+                return
+            if self.closing:
+                return
+            self._refresh_detected_agents()
+        # A detected agent may return to its shell while the confirmation is open.
+        for session in agents:
+            if session.kind == "agent":
+                self.close_session(session, confirm=False)
+
     def close_session(self, session, confirm=True):
         if session not in self.sessions:
             return
@@ -974,6 +1092,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
             if not self.confirm(f"Close {session.title}?", "This will stop the session running in this tab.", "Close Tab"):
                 return
         self.sessions.remove(session)
+        self.broadcast_watches = [watch for watch in self.broadcast_watches if session not in watch.recipients]
         self.last_states.pop(session, None)
         self.idle_agents.discard(session)
         self.custom_selection.pop(session, None)
@@ -1092,6 +1211,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
     def _destroyed(self, *_):
         self.closing = True
+        self.broadcast_watches.clear()
         self._cancel_usage_timers()
         self.usage_panel.destroy()
         had_login = any(session.kind == "login" for session in self.sessions)

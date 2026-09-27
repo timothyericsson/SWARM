@@ -7,9 +7,11 @@ import time
 import unittest
 import subprocess
 import shlex
-from unittest.mock import patch
+import signal
+from unittest.mock import PropertyMock, patch
 
-from swarm_app.app import BroadcastDialog, Gtk, SwarmApplication
+from swarm_app.app import BroadcastDialog, Gdk, Gtk, SwarmApplication
+from swarm_app.codex_detection import DetectedCodex
 from swarm_app.session import TerminalSession
 from test_session import FIXTURE, process_alive, pump_until
 
@@ -220,6 +222,28 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(session.kind, "agent")
         self.assertEqual(self.window.stack.get_visible_child_name(), "sessions")
 
+    def shortcut_agent(self):
+        folder = self.directory / str(len(self.sessions))
+        folder.mkdir()
+        argv = ["/usr/bin/python3", str(FIXTURE), str(folder), "record"]
+        with patch.object(self.window, "resolve_codex", return_value="/test/codex"), \
+                patch("swarm_app.app.codex_agent_command", return_value=argv) as command:
+            activated = Gtk.accel_groups_activate(
+                self.window, Gdk.KEY_t, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
+        self.assertTrue(activated)
+        command.assert_called_once_with("/test/codex")
+        agent = self.window.current()
+        self.sessions.append(agent)
+        pump_until(lambda: agent.state == "running" and (folder / "ready").exists())
+        return agent
+
+    def test_ctrl_shift_t_launches_agent_with_managed_activity_title(self):
+        agent = self.shortcut_agent()
+        self.assertEqual(self.window.sessions, [agent])
+        self.assertEqual(agent.kind, "agent")
+        self.assertEqual(agent.origin_kind, "agent")
+        self.assertTrue(agent.managed_activity_title)
+
     def test_broadcast_reaches_all_agents_only_in_current_window(self):
         first, folder1 = self.add()
         second, folder2 = self.add()
@@ -261,6 +285,238 @@ class WindowTests(unittest.TestCase):
         self.assertFalse(self.window.broadcast("bad\x1b[201~"))
         self.assertEqual((folder / "input").read_bytes(), b"")
 
+    def notifying_broadcast(self):
+        self.assertTrue(self.window.broadcast("Do the task", notify_when_done=True))
+        watch = self.window.broadcast_watches[-1]
+        pump_until(lambda: watch.submitted == set(watch.recipients))
+        return watch
+
+    def check_after_ready_delay(self, watch):
+        self.assertIsNotNone(watch.ready_since)
+        with patch("swarm_app.app.time.monotonic", return_value=watch.ready_since + 2):
+            self.window._check_broadcast_notifications()
+
+    def test_global_broadcast_notification_checkbox_is_opt_in_and_global_only(self):
+        agent, _folder = self.add()
+        self.activity_title(agent, "Ready")
+        self.window.open_broadcast()
+        dialog = self.window.broadcast_dialog
+        self.assertTrue(dialog.notification_options.get_visible())
+        self.assertTrue(dialog.notify_checkbox.get_sensitive())
+        self.assertFalse(dialog.notify_checkbox.get_active())
+        dialog.notify_checkbox.set_active(True)
+        dialog.set_mode(idle_only=True)
+        self.assertFalse(dialog.notification_options.get_visible())
+        dialog.editor.get_buffer().set_text("Sleeper task")
+        with patch.object(self.window, "broadcast", return_value=True) as broadcast:
+            dialog.response(Gtk.ResponseType.OK)
+        self.assertTrue(broadcast.call_args.kwargs.get("idle_only"))
+        self.assertFalse(broadcast.call_args.kwargs.get("notify_when_done", False))
+
+        self.window.open_broadcast()
+        dialog = self.window.broadcast_dialog
+        dialog.notify_checkbox.set_active(True)
+        dialog.editor.get_buffer().set_text("Global task")
+        with patch.object(self.window, "broadcast", return_value=True) as broadcast:
+            dialog.response(Gtk.ResponseType.OK)
+        broadcast.assert_called_once()
+        self.assertEqual(broadcast.call_args.args, ("Global task",))
+        self.assertTrue(broadcast.call_args.kwargs.get("notify_when_done"))
+        self.assertFalse(broadcast.call_args.kwargs.get("idle_only", False))
+
+        self.window.open_broadcast()
+        dialog = self.window.broadcast_dialog
+        manual, _folder = self.add()
+        dialog._refresh()
+        self.assertFalse(manual.managed_activity_title)
+        self.assertTrue(dialog.notify_checkbox.get_sensitive())
+        manual.origin_kind = "shell"
+        with patch.object(self.window, "active_agents", return_value=[agent, manual]):
+            dialog._refresh()
+            self.assertTrue(dialog.notify_checkbox.get_sensitive())
+            dialog.notify_checkbox.set_active(True)
+        with patch.object(self.window, "active_agents", return_value=[]):
+            dialog._refresh()
+            self.assertFalse(dialog.notify_checkbox.get_sensitive())
+            self.assertFalse(dialog.notify_checkbox.get_active())
+        dialog.response(Gtk.ResponseType.CANCEL)
+
+    def test_broadcast_without_notification_option_never_arms_alert(self):
+        agent, folder = self.add()
+        self.activity_title(agent, "Ready")
+        with patch("swarm_app.app.notify_agents_finished") as notify:
+            self.assertTrue(self.window.broadcast("Regular broadcast"))
+            pump_until(lambda: (folder / "input").read_bytes().endswith(b"\r"))
+            self.activity_title(agent, "Working")
+            self.activity_title(agent, "Ready")
+            self.window._check_broadcast_notifications()
+        self.assertEqual(self.window.broadcast_watches, [])
+        notify.assert_not_called()
+
+    def test_broadcast_notification_waits_for_all_recipients_and_fires_once(self):
+        first, _folder = self.add()
+        second, _folder = self.add()
+        for session in (first, second):
+            self.activity_title(session, "Ready")
+        other_window = self.app.new_window(start_terminal=False)
+        self.windows.append(other_window)
+        other, _folder = self.add(other_window)
+        self.activity_title(other, "Working")
+        with patch("swarm_app.app.notify_agents_finished") as notify:
+            watch = self.notifying_broadcast()
+            self.assertEqual(watch.recipients, frozenset((first, second)))
+            unrelated, _folder = self.add()
+            self.activity_title(unrelated, "Working")
+            for session in (first, second):
+                self.activity_title(session, "Working")
+            self.activity_title(first, "Ready")
+            self.assertIsNone(watch.ready_since)
+            notify.assert_not_called()
+            self.activity_title(second, "Ready")
+            self.assertIsNotNone(watch.ready_since)
+            notify.assert_not_called()
+            self.check_after_ready_delay(watch)
+            self.window._check_broadcast_notifications()
+            notify.assert_called_once()
+            self.assertEqual(notify.call_args.args, (2,))
+            self.assertTrue(callable(notify.call_args.kwargs["on_error"]))
+        self.assertEqual(self.window.broadcast_watches, [])
+        self.assertTrue(unrelated.agent_busy)
+        self.assertTrue(other.agent_busy)
+
+    def test_broadcast_notification_tracks_mixed_manual_and_managed_agents(self):
+        manual, folder = self.add(kind="shell")
+        process = manual._process
+        detected = DetectedCodex(process.pid, process.start, process.session, process.group, str(folder))
+        with patch.object(manual, "_foreground_codex", return_value=detected):
+            manual.refresh_agent(self.app.codex)
+            self.assertTrue(manual.is_detected_agent)
+            managed = self.shortcut_agent()
+            self.activity_title(managed, "Ready")
+            manual.terminal.feed(b"\x1b]0;My project\x07")
+            pump_until(lambda: manual.terminal.get_window_title() == "My project")
+            self.assertFalse(manual.managed_activity_title)
+            with patch("swarm_app.app.notify_agents_finished") as notify:
+                watch = self.notifying_broadcast()
+                self.assertEqual(watch.recipients, frozenset((manual, managed)))
+                self.activity_title(managed, "Working")
+                self.activity_title(managed, "Ready")
+                self.assertEqual(watch.started, {managed})
+                self.assertIsNone(watch.ready_since)
+                notify.assert_not_called()
+                for title in ("⠋ My project", "[ ! ] Action Required", "Starting", "My project"):
+                    manual.terminal.feed(f"\x1b]0;{title}\x07".encode())
+                    pump_until(lambda: manual.terminal.get_window_title() == title)
+                    manual.refresh_activity()
+                    self.window._check_broadcast_notifications()
+                    if title != "My project":
+                        self.assertIsNone(watch.ready_since)
+                        notify.assert_not_called()
+                self.assertEqual(watch.started, {manual, managed})
+                self.assertEqual(watch.busy_titles[manual], "⠋ My project")
+                self.check_after_ready_delay(watch)
+                notify.assert_called_once()
+                self.assertEqual(notify.call_args.args, (2,))
+        self.assertEqual(self.window.broadcast_watches, [])
+        self.assertFalse(manual.managed_activity_title)
+
+    def test_broadcast_notification_requires_work_and_stable_ready(self):
+        agent, _folder = self.add()
+        self.activity_title(agent, "Ready")
+        with patch("swarm_app.app.notify_agents_finished") as notify:
+            watch = self.notifying_broadcast()
+            self.window._check_broadcast_notifications()
+            self.assertEqual(watch.started, set())
+            self.assertIsNone(watch.ready_since)
+            self.activity_title(agent, "Working")
+            self.assertEqual(watch.started, {agent})
+            for title in ("[ ! ] Action Required", "Unknown status"):
+                self.activity_title(agent, title)
+                self.window._check_broadcast_notifications()
+                self.assertIsNone(watch.ready_since)
+            self.activity_title(agent, "Ready")
+            self.assertIsNotNone(watch.ready_since)
+            with patch("swarm_app.app.time.monotonic", return_value=watch.ready_since + 0.5):
+                self.window._check_broadcast_notifications()
+            notify.assert_not_called()
+            self.activity_title(agent, "Working")
+            self.assertIsNone(watch.ready_since)
+            self.activity_title(agent, "Ready")
+            self.check_after_ready_delay(watch)
+            notify.assert_called_once()
+
+    def test_broadcast_notification_is_cancelled_when_recipient_closes_or_exits(self):
+        with patch("swarm_app.app.notify_agents_finished") as notify:
+            for action in ("close", "exit"):
+                with self.subTest(action=action):
+                    agent, _folder = self.add()
+                    self.activity_title(agent, "Ready")
+                    watch = self.notifying_broadcast()
+                    self.activity_title(agent, "Working")
+                    self.activity_title(agent, "Ready")
+                    if action == "close":
+                        self.window.close_session(agent, confirm=False)
+                    else:
+                        os.kill(agent.pid, signal.SIGTERM)
+                        pump_until(lambda: agent.state == "exited")
+                    self.assertEqual(self.window.broadcast_watches, [])
+                    self.check_after_ready_delay(watch)
+            notify.assert_not_called()
+
+    def test_broadcast_notification_is_cancelled_if_recipient_process_is_replaced(self):
+        agent, _folder = self.add()
+        self.activity_title(agent, "Ready")
+        with patch("swarm_app.app.notify_agents_finished") as notify:
+            watch = self.notifying_broadcast()
+            self.assertEqual(watch.identities[agent], agent.agent_identity)
+            self.activity_title(agent, "Working")
+            self.activity_title(agent, "Ready")
+            with patch.object(TerminalSession, "agent_identity", new_callable=PropertyMock,
+                              return_value=("replacement",)):
+                self.window._check_broadcast_notifications()
+            self.assertEqual(self.window.broadcast_watches, [])
+            self.check_after_ready_delay(watch)
+            notify.assert_not_called()
+
+    def test_broadcast_notification_is_cancelled_if_any_delivery_fails(self):
+        first, _folder = self.add()
+        failed, _folder = self.add()
+        for session in (first, failed):
+            self.activity_title(session, "Ready")
+        completions = []
+
+        def delayed_delivery(_message, completed, **_kwargs):
+            completions.append(completed)
+            return True
+
+        with patch.object(first, "broadcast", side_effect=delayed_delivery), \
+                patch.object(failed, "broadcast", side_effect=delayed_delivery), \
+                patch("swarm_app.app.notify_agents_finished") as notify:
+            self.assertTrue(self.window.broadcast("Task", notify_when_done=True))
+            self.assertEqual(len(self.window.broadcast_watches), 1)
+            completions[1](False)
+            self.assertEqual(self.window.broadcast_watches, [])
+            completions[0](True)
+            for session in (first, failed):
+                self.activity_title(session, "Working")
+                self.activity_title(session, "Ready")
+            self.window._check_broadcast_notifications()
+            self.assertEqual(self.window.broadcast_watches, [])
+            notify.assert_not_called()
+
+    def test_new_overlapping_broadcast_supersedes_previous_notification(self):
+        agent, _folder = self.add()
+        self.activity_title(agent, "Ready")
+        with patch("swarm_app.app.notify_agents_finished") as notify:
+            previous = self.notifying_broadcast()
+            latest = self.notifying_broadcast()
+            self.assertTrue(all(watch is not previous for watch in self.window.broadcast_watches))
+            self.assertEqual(self.window.broadcast_watches, [latest])
+            self.activity_title(agent, "Working")
+            self.activity_title(agent, "Ready")
+            self.check_after_ready_delay(latest)
+            notify.assert_called_once()
+
     def test_closing_last_tab_restores_blank_workspace(self):
         session, _folder = self.add()
         self.window.close_session(session, confirm=False)
@@ -268,6 +524,112 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.window.stack.get_visible_child_name(), "empty")
         self.assertFalse(self.window.global_item.get_sensitive())
         self.assertEqual(session.state, "closed")
+
+    def activity_title(self, session, title):
+        session.managed_activity_title = True
+        session.terminal.feed(f"\x1b]0;{title}\x07".encode())
+        pump_until(lambda: session.terminal.get_window_title() == title)
+        session.refresh_activity()
+
+    def test_kill_all_agents_is_disabled_without_agent_tabs(self):
+        self.assertFalse(self.window.kill_all_agents_item.get_sensitive())
+        shell, _folder = self.add(kind="shell")
+        login, _folder = self.add(kind="login")
+        self.assertFalse(self.window.kill_all_agents_item.get_sensitive())
+        with patch.object(self.window, "confirm") as confirm:
+            self.window.kill_all_agents()
+        confirm.assert_not_called()
+        self.assertEqual(self.window.sessions, [shell, login])
+        self.assertEqual([session.state for session in self.window.sessions], ["running", "running"])
+
+    def test_kill_all_agents_menu_closes_idle_agents_without_warning(self):
+        idle, _folder = self.add()
+        unknown, _folder = self.add()
+        self.activity_title(idle, "Ready")
+        self.assertTrue(idle.agent_idle)
+        self.assertIsNone(unknown.activity)
+        self.assertTrue(self.window.kill_all_agents_item.get_sensitive())
+        with patch.object(self.window, "confirm") as confirm:
+            self.window.kill_all_agents_item.activate()
+        confirm.assert_not_called()
+        self.assertEqual([idle.state, unknown.state], ["closed", "closed"])
+        self.assertEqual(self.window.sessions, [])
+        self.assertEqual(self.window.stack.get_visible_child_name(), "empty")
+        self.assertFalse(self.window.kill_all_agents_item.get_sensitive())
+
+    def test_kill_all_agents_warns_once_and_honors_cancel_or_accept(self):
+        first, _folder = self.add()
+        second, _folder = self.add()
+        idle, _folder = self.add()
+        for session in (first, second):
+            self.activity_title(session, "Working")
+        self.activity_title(idle, "Ready")
+        # The action must refresh activity before deciding whether to warn.
+        first.activity = None
+        second.activity = None
+        with patch.object(self.window, "confirm", return_value=False) as confirm:
+            self.window.kill_all_agents()
+        confirm.assert_called_once()
+        title, detail, button = confirm.call_args.args
+        self.assertEqual(title, "Kill all agents?")
+        self.assertIn("2 agents are still running", detail)
+        self.assertIn("3 agent tabs in this window", detail)
+        self.assertEqual(button, "Kill All Agents")
+        self.assertEqual(self.window.sessions, [first, second, idle])
+        self.assertTrue(all(session.state == "running" for session in self.window.sessions))
+        with patch.object(self.window, "confirm", return_value=True) as confirm:
+            self.window.kill_all_agents()
+        confirm.assert_called_once()
+        self.assertEqual(self.window.sessions, [])
+        self.assertTrue(all(session.state == "closed" for session in (first, second, idle)))
+
+    def test_kill_all_agents_includes_nonrunning_tabs_and_preserves_other_sessions(self):
+        exited, _folder = self.add(mode="exit")
+        self.assertTrue(self.window.kill_all_agents_item.get_sensitive())
+        with patch.object(TerminalSession, "start"):
+            starting = self.window.add_session("Starting", "agent", [], str(self.directory))
+            failed = self.window.add_session("Failed", "agent", [], str(self.directory))
+        self.sessions.extend([starting, failed])
+        failed.state = "failed"
+        self.window._session_changed(failed)
+        shell, _folder = self.add(kind="shell")
+        login, _folder = self.add(kind="login")
+        other_window = self.app.new_window(start_terminal=False)
+        self.windows.append(other_window)
+        other, _folder = self.add(other_window)
+        self.activity_title(other, "Working")
+        with patch.object(self.window, "confirm") as confirm:
+            self.window.kill_all_agents()
+        confirm.assert_not_called()
+        self.assertTrue(all(session.state == "closed" for session in (exited, starting, failed)))
+        self.assertEqual(self.window.sessions, [shell, login])
+        self.assertFalse(self.window.kill_all_agents_item.get_sensitive())
+        self.assertEqual(other_window.sessions, [other])
+        self.assertTrue(other.agent_busy)
+        self.assertTrue(other_window.kill_all_agents_item.get_sensitive())
+
+    def test_kill_all_agents_rechecks_kind_and_preserves_tabs_added_during_warning(self):
+        busy, _folder = self.add()
+        demoted, _folder = self.add()
+        self.activity_title(busy, "Working")
+        added = []
+
+        def refresh_kind(_codex):
+            if added:
+                demoted.kind = "shell"
+
+        def accept_after_new_tab(*_args):
+            added.append(self.add()[0])
+            return True
+
+        with patch.object(demoted, "refresh_agent", side_effect=refresh_kind), \
+                patch.object(self.window, "confirm", side_effect=accept_after_new_tab) as confirm:
+            self.window.kill_all_agents()
+        confirm.assert_called_once()
+        self.assertEqual(busy.state, "closed")
+        self.assertEqual(self.window.sessions, [demoted, added[0]])
+        self.assertEqual(demoted.kind, "shell")
+        self.assertEqual([session.state for session in self.window.sessions], ["running", "running"])
 
     def test_ended_agent_tab_shows_killed_skull_in_red(self):
         agent, _folder = self.add(mode="exit")

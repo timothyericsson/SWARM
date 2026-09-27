@@ -25,7 +25,7 @@ gi.require_version("Vte", "2.91")
 from gi.repository import Gio, GLib, Gtk, Vte
 
 from .codex_detection import DetectedCodex, find_foreground_codex
-from .activity import title_activity, title_is_ready
+from .activity import title_activity, title_finished, title_is_ready
 
 
 MAX_MESSAGE_BYTES = 64 * 1024
@@ -223,6 +223,15 @@ class TerminalSession(Gtk.Box):
             and self._read_activity() is False
         )
 
+    def activity_finished(self, busy_title: str | None) -> bool:
+        """Read completion without relaxing idle-only broadcast eligibility."""
+        if self.agent_identity is None:
+            return False
+        if not title_finished(self.terminal.get_window_title(), busy_title,
+                              managed=self.managed_activity_title):
+            return False
+        return not self.managed_activity_title or self._read_activity() is False
+
     def _read_activity(self) -> bool | None:
         if self.kind != "agent" or self.state != "running" or self._process is None:
             return None
@@ -396,6 +405,23 @@ class TerminalSession(Gtk.Box):
         return self._broadcast_target()
 
     @property
+    def agent_identity(self) -> tuple[int, int, int] | None:
+        """The live agent identity, independent of terminal input readiness."""
+        if self.kind != "agent" or self.state != "running" or self._process is None:
+            return None
+        current = _read_process(self._process.pid)
+        if (current is None or current.start != self._process.start
+                or current.state in {"Z", "X", "x", "T", "t"}):
+            return None
+        if self.origin_kind == "shell":
+            detected = self._foreground_codex()
+            if (detected is None or self._detected_codex is None
+                    or self._agent_identity(detected) != self._agent_identity(self._detected_codex)):
+                return None
+            return self._agent_identity(detected)
+        return current.pid, current.start, current.group
+
+    @property
     def can_receive_sleeper_broadcast(self) -> bool:
         """Ready now, with no other message already being delivered to the TUI."""
         return (
@@ -406,22 +432,9 @@ class TerminalSession(Gtk.Box):
         )
 
     def _broadcast_target(self) -> tuple[int, int, int] | None:
-        live = (
-            self.kind == "agent"
-            and self.state == "running"
-            and self._process is not None
-            and _same_process(self._process)
-        )
-        if not live:
+        target = self.agent_identity
+        if target is None:
             return None
-        if self.origin_kind == "shell":
-            detected = self._foreground_codex()
-            if (detected is None or self._detected_codex is None
-                    or self._agent_identity(detected) != self._agent_identity(self._detected_codex)):
-                return None
-            target = self._agent_identity(detected)
-        else:
-            target = self._process.pid, self._process.start, self._process.group
         pty = self.terminal.get_pty()
         if pty is None:
             return None

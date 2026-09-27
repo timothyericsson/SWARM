@@ -58,3 +58,24 @@ def title_activity(title: str | None, *, managed: bool = False) -> bool | None:
             return True
         return None
     return True if spinning else None
+
+
+def title_finished(title: str | None, busy_title: str | None, *, managed: bool = False) -> bool:
+    """Recognize completion after a broadcast has already observed work.
+
+    Managed titles supply an explicit Ready state. Default manual Codex titles
+    retain the thread or project name when the activity spinner disappears.
+    A missing or cleared title is unavailable status, never completion.
+    """
+    if managed:
+        return title_is_ready(title, managed=True)
+    if title_activity(busy_title) is not True or not isinstance(title, str):
+        return False
+    text = title.strip()
+    if text.startswith("● "):
+        text = text[2:].lstrip()
+    if not text or text == "●" or text[0] in SPINNER_FRAMES:
+        return False
+    if text.startswith(("[ ! ] Action Required", "[ . ] Action Required")):
+        return False
+    return text not in {"Starting", "Working", "Thinking", "Waiting"}
