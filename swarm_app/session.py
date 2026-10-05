@@ -157,13 +157,16 @@ def _terminate_processes(leader: _Process | None) -> None:
 
 class TerminalSession(Gtk.Box):
     def __init__(self, title: str, kind: str, directory: str, on_change: Callable,
-                 *, managed_activity_title: bool = False):
+                 *, managed_activity_title: bool = False, harness: str = "codex"):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         if kind not in {"agent", "login", "shell"}:
             raise ValueError("Session kind must be agent, login, or shell.")
+        if harness not in {"codex", "hermes"}:
+            raise ValueError("Agent harness must be Codex or Hermes.")
         self.title = title
         self.kind = kind
         self.origin_kind = kind
+        self.harness = harness
         self.managed_activity_title = managed_activity_title
         self.activity: bool | None = None
         self._last_agent_idle = False
@@ -225,7 +228,7 @@ class TerminalSession(Gtk.Box):
 
     def activity_finished(self, busy_title: str | None) -> bool:
         """Read completion without relaxing idle-only broadcast eligibility."""
-        if self.agent_identity is None:
+        if self.harness != "codex" or self.agent_identity is None:
             return False
         if not title_finished(self.terminal.get_window_title(), busy_title,
                               managed=self.managed_activity_title):
@@ -233,6 +236,9 @@ class TerminalSession(Gtk.Box):
         return not self.managed_activity_title or self._read_activity() is False
 
     def _read_activity(self) -> bool | None:
+        # Hermes does not expose the Codex title protocol used by this reader.
+        if self.harness != "codex":
+            return None
         if self.kind != "agent" or self.state != "running" or self._process is None:
             return None
         if self.origin_kind == "shell" and self._detected_codex is None:
@@ -521,6 +527,20 @@ class TerminalSession(Gtk.Box):
         self._cancel_deliveries()
         self.terminal.set_input_enabled(False)
         self._changed()
+
+    def interrupt(self) -> bool:
+        """Cancel pending broadcasts and send Escape to the current agent."""
+        target = self._broadcast_target()
+        self._cancel_deliveries()
+        # Cancellation callbacks may close a session or change its foreground
+        # process. Never send input to a replacement agent or a returned shell.
+        if target is None or self._broadcast_target() != target:
+            return False
+        try:
+            self.terminal.feed_child(b"\x1b")
+        except (GLib.Error, RuntimeError):
+            return False
+        return True
 
     def broadcast(
         self,

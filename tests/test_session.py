@@ -75,10 +75,10 @@ class SessionTests(unittest.TestCase):
         pump_until(lambda: all(s.pid is None or not process_alive(s.pid) for s in self.sessions))
         self.temp.cleanup()
 
-    def new_session(self, kind="agent", mode="record", start=True):
+    def new_session(self, kind="agent", mode="record", start=True, harness="codex"):
         directory = self.folder / str(len(self.sessions))
         directory.mkdir()
-        session = TerminalSession("Test", kind, str(directory), lambda _session: None)
+        session = TerminalSession("Test", kind, str(directory), lambda _session: None, harness=harness)
         window = Gtk.Window()
         window.add(session)
         window.show_all()
@@ -126,6 +126,80 @@ class SessionTests(unittest.TestCase):
         pump_until(lambda: (directory / "input").read_bytes() == expected)
         self.assertEqual(results, [True, True, True])
 
+    def test_interrupt_sends_only_escape_and_keeps_session_running(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        self.assertTrue(session.interrupt())
+        pump_until(lambda: (directory / "input").read_bytes() == b"\x1b")
+        self.assertEqual(session.state, "running")
+        self.assertTrue(process_alive(session.pid))
+
+    def test_interrupt_cancels_inflight_and_queued_broadcasts_without_enter(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        results = []
+        self.assertTrue(session.broadcast("one", results.append))
+        self.assertTrue(session.broadcast("two", results.append))
+        self.assertTrue(session.interrupt())
+        self.assertEqual(results, [False, False])
+        started = time.monotonic()
+        pump_until(lambda: time.monotonic() - started > 0.2)
+        self.assertEqual((directory / "input").read_bytes(), b"\x1b[200~one\x1b[201~\x1b")
+        self.assertEqual(results, [False, False])
+
+    def test_interrupt_rejects_shell_login_and_canonical_startup(self):
+        for kind, mode in (("shell", "record"), ("login", "record"), ("agent", "canonical")):
+            with self.subTest(kind=kind, mode=mode):
+                session, directory = self.new_session(kind=kind, mode=mode)
+                self.ready(session, directory)
+                self.assertFalse(session.interrupt())
+                self.assertEqual((directory / "input").read_bytes(), b"")
+
+    def test_interrupt_detected_agent_requires_original_foreground_process(self):
+        session, directory = self.new_session(kind="shell")
+        self.ready(session, directory)
+        process = session._process
+        detected = DetectedCodex(process.pid, process.start, process.session, process.group, str(directory))
+        session.kind = "agent"
+        session._detected_codex = detected
+        for current in (None, replace(detected, start=detected.start + 1)):
+            with self.subTest(current=current), patch.object(session, "_foreground_codex", return_value=current):
+                self.assertFalse(session.interrupt())
+                self.assertEqual((directory / "input").read_bytes(), b"")
+        with patch.object(session, "_foreground_codex", return_value=detected):
+            self.assertTrue(session.interrupt())
+        pump_until(lambda: (directory / "input").read_bytes() == b"\x1b")
+
+    def test_interrupt_rechecks_agent_after_cancelling_deliveries(self):
+        session, directory = self.new_session(kind="shell")
+        self.ready(session, directory)
+        process = session._process
+        detected = DetectedCodex(process.pid, process.start, process.session, process.group, str(directory))
+        session.kind = "agent"
+        session._detected_codex = detected
+        results = []
+
+        def demote_on_cancel(success):
+            results.append(success)
+            session.kind = "shell"
+            session._detected_codex = None
+
+        with patch.object(session, "_foreground_codex", return_value=detected):
+            self.assertTrue(session.broadcast("one", demote_on_cancel))
+            self.assertFalse(session.interrupt())
+        self.assertEqual(results, [False])
+        started = time.monotonic()
+        pump_until(lambda: time.monotonic() - started > 0.2)
+        self.assertEqual((directory / "input").read_bytes(), b"\x1b[200~one\x1b[201~")
+
+    def test_interrupt_reports_failed_terminal_write(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        for error in (GLib.Error("terminal unavailable"), RuntimeError("terminal unavailable")):
+            with self.subTest(error=type(error).__name__), patch.object(session.terminal, "feed_child", side_effect=error):
+                self.assertFalse(session.interrupt())
+        self.assertEqual((directory / "input").read_bytes(), b"")
+
     def test_login_session_rejects_broadcast(self):
         session, directory = self.new_session(kind="login")
         self.ready(session, directory)
@@ -133,6 +207,26 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(session.broadcast("never send this", results.append))
         self.assertEqual(results, [False])
         self.assertEqual((directory / "input").read_bytes(), b"")
+
+    def test_hermes_receives_broadcasts_without_codex_activity_inference(self):
+        session, directory = self.new_session(harness="hermes")
+        self.ready(session, directory)
+        for title in ("Working", "Ready", "⠋ Task | project", "Task | project"):
+            with self.subTest(title=title):
+                session.terminal.feed(f"\x1b]0;{title}\x07".encode())
+                pump_until(lambda: session.terminal.get_window_title() == title)
+                session.refresh_activity()
+                self.assertIsNone(session.activity)
+                self.assertFalse(session.agent_busy)
+                self.assertFalse(session.agent_idle)
+                self.assertFalse(session.can_receive_sleeper_broadcast)
+                self.assertFalse(session.activity_finished("⠋ Task | project"))
+        results = []
+        self.assertTrue(session.broadcast("Hello Hermes", results.append))
+        pump_until(lambda: bool(results))
+        expected = b"\x1b[200~Hello Hermes\x1b[201~\r"
+        pump_until(lambda: (directory / "input").read_bytes() == expected)
+        self.assertEqual(results, [True])
 
     def test_canonical_startup_input_rejects_broadcast(self):
         session, directory = self.new_session(mode="canonical")

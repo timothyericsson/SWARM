@@ -5,7 +5,7 @@ usage() {
   printf '%s\n' \
     'Usage: ./install.sh' \
     'Install SWARM desktop dependencies on Debian 12 or newer.' \
-    'Uses sudo when not running as root. Codex CLI is installed separately.'
+    'Uses sudo when not running as root. Agent CLIs are installed separately.'
 }
 
 if [ "$#" -gt 0 ]; then
@@ -38,6 +38,6 @@ as_root apt-get install -y python3 python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91
 
 printf '\n%s\n' \
   'Desktop dependencies installed.' \
-  'Make sure Codex CLI is installed separately and codex is on your PATH.' \
+  'Install each enabled harness (Codex and/or Hermes) separately and put its command on your PATH.' \
   'From the SWARM source folder, launch with ./swarm.' \
   'For an application-menu entry, run ./scripts/install-local.sh as your normal user.'

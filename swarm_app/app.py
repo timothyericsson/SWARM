@@ -22,6 +22,8 @@ from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, Vte
 from . import __version__
 from .activity import codex_agent_command
 from .custom_broadcast import CustomBroadcastDialog
+from .linked_agents import HARNESS_NAMES, LinkedAgentsSettings
+from .linked_agents_dialog import LinkedAgentsDialog
 from .notifications import notify_agents_finished
 from .session import TerminalSession, normalize_message
 from .usage import UsageUnavailable, fetch_usage
@@ -186,19 +188,20 @@ class BroadcastDialog(Gtk.Dialog):
     def _refresh(self):
         targets = self.owner.ready_agents() if self.idle_only else self.owner.active_agents()
         count = len(targets)
-        can_notify = not self.idle_only and bool(targets)
+        can_notify = not self.idle_only and bool(targets) and all(session.harness == "codex" for session in targets)
         self.notification_options.set_visible(not self.idle_only)
         self.notify_checkbox.set_sensitive(can_notify)
         if not can_notify:
             self.notify_checkbox.set_active(False)
         self.notify_help.set_text(
             "One desktop notification when all recipients finish working." if can_notify else
+            "Completion notifications are available for Codex-only broadcasts." if targets else
             "No agents can receive a broadcast yet.")
         recipients = f"{count} {'idle ' if self.idle_only else ''}agent{'s' if count != 1 else ''}"
         summary = f"Send immediately to {recipients} in this window."
         if self.idle_only:
             summary += ("\nOnly agents ready for a new message receive it. "
-                        "Idle detection requires a session opened with New Agent. "
+                        "Idle detection requires Codex opened through SWARM. "
                         "Agents with unavailable status are skipped.")
         self.summary.set_text(summary)
         self.send_button.set_label(f"Send to {recipients}")
@@ -261,6 +264,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.closing = False
         self.broadcast_dialog = None
         self.custom_broadcast_dialog = None
+        self.linked_agents_dialog = None
         self.custom_selection = {}
         self.broadcast_watches = []
         self.flash_source = 0
@@ -309,6 +313,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.folder_label.set_hexpand(True)
         self.folder_label.set_xalign(1)
         self.account_label = label(app.auth_status)
+        self.account_label.set_tooltip_text("Codex account status. Hermes uses its own sign-in.")
         status.pack_start(self.status_label, False, False, 0)
         status.pack_start(self.folder_label, True, True, 0)
         status.pack_end(self.account_label, False, False, 0)
@@ -342,6 +347,10 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.usage_button.connect("leave-notify-event", self._usage_leave)
         badge.pack_start(self.usage_button, False, False, 0)
         header.pack_start(badge)
+        self.open_swarm_button = Gtk.Button(label="Open Swarm")
+        self.open_swarm_button.set_tooltip_text("Open one agent tab for each enabled harness in the current folder")
+        self.open_swarm_button.connect("clicked", lambda *_: self.open_swarm())
+        header.pack_end(self.open_swarm_button)
         self._create_usage_panel()
         header.show_all()
         return header
@@ -521,15 +530,19 @@ class SwarmWindow(Gtk.ApplicationWindow):
         item(session, "Close Window", self.close)
 
         swarm = menu("S_warm")
+        self.open_swarm_item = item(swarm, "_Open Swarm", self.open_swarm)
         item(swarm, "_New Agent", self.new_agent, "<Primary><Shift>t")
         separator(swarm)
         self.global_item = item(swarm, "_Global Broadcast…", self.open_broadcast, "<Primary><Shift>b")
         self.sleeper_item = item(swarm, "_Sleeper Broadcast…", self.open_sleeper_broadcast)
         self.custom_item = item(swarm, "_Custom Broadcast…", self.open_custom_broadcast)
         separator(swarm)
+        self.interrupt_all_agents_item = item(swarm, "_Interrupt All Agents", self.interrupt_all_agents)
         self.kill_all_agents_item = item(swarm, "_Kill All Agents", self.kill_all_agents)
 
         actions = menu("_Actions")
+        self.linked_agents_item = item(actions, "_Linked Agents…", self.open_linked_agents)
+        separator(actions)
         item(actions, "_Rename Agent…", self.rename_current)
         item(actions, "_Restart Exited Agent", self.restart_current)
 
@@ -559,7 +572,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
             return str(Path(executable).resolve())
         self.message("Codex CLI was not found",
                      "Install Codex CLI and make sure codex is on your PATH, or start SWARM "
-                     "with --codex /path/to/codex.")
+                     "with --codex /path/to/codex. You can also turn Codex off in Actions → Linked Agents.")
         return None
 
     def new_agent(self):
@@ -575,6 +588,54 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.agent_number += 1
         return self.add_session(f"Agent {self.agent_number}", "agent", codex_agent_command(executable),
                                 directory, managed_activity_title=True)
+
+    def open_linked_agents(self):
+        if self.closing:
+            return
+        if self.linked_agents_dialog is None:
+            self.linked_agents_dialog = LinkedAgentsDialog(self)
+        self.linked_agents_dialog.present()
+
+    def resolve_harness(self, harness):
+        if harness == "codex":
+            return self.resolve_codex()
+        executable = shutil.which(self.app.hermes)
+        if executable:
+            return str(Path(executable).resolve())
+        self.message("Hermes CLI was not found",
+                     "Install Hermes and make sure hermes is on your PATH, or start SWARM "
+                     "with --hermes /path/to/hermes. You can also turn Hermes off in Actions → Linked Agents.")
+        return None
+
+    def open_swarm(self):
+        if self.closing:
+            return []
+        enabled = [harness for harness in HARNESS_NAMES if self.app.linked_agents.enabled[harness]]
+        if not enabled:
+            self.message("No linked agents enabled", "Turn on Codex or Hermes in Actions → Linked Agents.")
+            self.open_linked_agents()
+            return []
+        if "codex" in enabled and self.app.logout_pending:
+            self.flash("Wait for Codex sign-out to finish before opening a swarm")
+            return []
+        directory = self._directory_for_new_session()
+        if directory is None:
+            return []
+        # Resolve every enabled command before spawning, so a missing harness
+        # does not leave a partially opened swarm or change the chosen folder.
+        executables = {}
+        for harness in enabled:
+            executable = self.resolve_harness(harness)
+            if executable is None:
+                return []
+            executables[harness] = executable
+        sessions = []
+        for harness, executable in executables.items():
+            self.agent_number += 1
+            argv = codex_agent_command(executable) if harness == "codex" else [executable]
+            sessions.append(self.add_session(f"{HARNESS_NAMES[harness]} {self.agent_number}", "agent", argv,
+                                             directory, managed_activity_title=harness == "codex", harness=harness))
+        return sessions
 
     def new_terminal(self, directory=None):
         directory = self._directory_for_new_session(directory, recover=True)
@@ -666,9 +727,9 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if executable:
             self.app.logout(executable)
 
-    def add_session(self, title, kind, argv, directory, *, managed_activity_title=False):
+    def add_session(self, title, kind, argv, directory, *, managed_activity_title=False, harness="codex"):
         session = TerminalSession(title, kind, directory, self._session_changed,
-                                  managed_activity_title=managed_activity_title)
+                                  managed_activity_title=managed_activity_title, harness=harness)
         terminal = session.terminal
         terminal.set_font(Pango.FontDescription(f"Monospace {self.font_size}"))
         terminal.set_scrollback_lines(20000)
@@ -864,6 +925,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.global_item.set_sensitive(count > 0)
         self.sleeper_item.set_sensitive(count > 0)
         self.custom_item.set_sensitive(count > 0)
+        self.interrupt_all_agents_item.set_sensitive(count > 0)
         self.kill_all_agents_item.set_sensitive(any(session.kind == "agent" for session in self.sessions))
         current = self.current()
         self._sync_workspace_folder()
@@ -933,6 +995,9 @@ class SwarmWindow(Gtk.ApplicationWindow):
             return False
         if notify_when_done and (idle_only or custom):
             self.flash("Finish notifications are available in Global Broadcast")
+            return False
+        if notify_when_done and any(session.harness != "codex" for session in targets):
+            self.flash("Finish notifications are available for Codex-only broadcasts")
             return False
         identities = {session: session.agent_identity for session in targets} if notify_when_done else {}
         if any(identity is None for identity in identities.values()):
@@ -1046,23 +1111,37 @@ class SwarmWindow(Gtk.ApplicationWindow):
         dialog.destroy()
 
     def restart_current(self):
-        if self.app.logout_pending:
-            self.flash("Wait for sign-out to finish before opening an agent")
-            return
         session = self.current()
         if not session or session.kind != "agent" or session.state not in ("failed", "exited"):
             self.flash("Select an exited agent to restart")
             return
-        executable = self.resolve_codex()
+        if session.harness == "codex" and self.app.logout_pending:
+            self.flash("Wait for sign-out to finish before opening an agent")
+            return
+        executable = self.resolve_harness(session.harness)
         if executable:
-            title, directory = session.title, session.directory
+            title, directory, harness = session.title, session.directory, session.harness
             self.close_session(session, confirm=False)
-            self.add_session(title, "agent", codex_agent_command(executable),
-                             directory, managed_activity_title=True)
+            argv = codex_agent_command(executable) if harness == "codex" else [executable]
+            self.add_session(title, "agent", argv, directory,
+                             managed_activity_title=harness == "codex", harness=harness)
 
     def close_current(self):
         if self.current():
             self.close_session(self.current())
+
+    def interrupt_all_agents(self):
+        if self.closing:
+            return
+        agents = self.active_agents()
+        if not agents:
+            self.flash("No agents ready to receive Escape in this window")
+            return
+        # Interrupted work must not later produce a broadcast-finished alert.
+        self.broadcast_watches = [watch for watch in self.broadcast_watches
+                                  if watch.recipients.isdisjoint(agents)]
+        sent = sum(session.interrupt() for session in agents)
+        self.flash(f"Escape sent to {sent} agent{'s' if sent != 1 else ''}")
 
     def kill_all_agents(self):
         if self.closing:
@@ -1173,18 +1252,20 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
     def quick_start(self):
         self.message("Using SWARM",
-                     "1. Session → Sign in with ChatGPT (if needed).\n"
+                     "1. Actions → Linked Agents: choose Codex and/or Hermes.\n"
                      "2. In the terminal, cd to your project folder.\n"
-                     "3. Run codex --yolo, or Swarm → New Agent (Ctrl+Shift+T).\n"
+                     "3. Click Open Swarm to open each enabled harness.\n"
                      "4. Swarm → Global Broadcast (Ctrl+Shift+B).\n\n"
+                     "Install and sign in to each CLI separately. Session sign-in and the usage badge "
+                     "are for Codex. Swarm → New Agent (Ctrl+Shift+T) opens an extra Codex tab.\n\n"
                      "New Agent uses the current terminal folder. Open another shell with "
                      "Session → New Terminal (Ctrl+Shift+Enter).\n\n"
                      "Codex started in a terminal automatically becomes an agent tab while it "
                      "runs in the foreground, then returns to a terminal when the shell returns. "
                      "Broadcast submits to all running agent tabs in this window. Shell prompts and sign-in "
                      "tabs are excluded. Complete Codex’s "
-                     "startup prompts first and leave its message input empty. Busy sessions handle "
-                     "the submitted input according to Codex’s normal behavior.\n\n"
+                     "startup prompts first and leave each harness’s message input empty. Busy sessions handle "
+                     "the submitted input according to that harness’s normal behavior.\n\n"
                      "Swarm → New Agent runs codex --yolo, with approvals and sandboxing disabled. "
                      "Manually started Codex keeps the options you supplied. "
                      "Sleeper Broadcast submits only to agents ready for a new message, skipping "
@@ -1196,7 +1277,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
     def about(self):
         dialog = Gtk.AboutDialog(transient_for=self, modal=True, program_name="SWARM", version=__version__,
-                                 comments="A terminal workspace for your Codex agents.",
+                                 comments="A terminal workspace for Codex and Hermes agents.",
                                  logo_icon_name="swarm-terminal")
         dialog.run()
         dialog.destroy()
@@ -1214,6 +1295,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.broadcast_watches.clear()
         self._cancel_usage_timers()
         self.usage_panel.destroy()
+        if self.linked_agents_dialog is not None:
+            self.linked_agents_dialog.destroy()
         had_login = any(session.kind == "login" for session in self.sessions)
         if self.directory_poll:
             GLib.source_remove(self.directory_poll)
@@ -1236,10 +1319,12 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
 
 class SwarmApplication(Gtk.Application):
-    def __init__(self, directory, codex="codex"):
+    def __init__(self, directory, codex="codex", hermes="hermes", *, linked_agents_path=None):
         super().__init__(application_id="io.swarm.Terminal", flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.directory = directory
         self.codex = codex
+        self.hermes = hermes
+        self.linked_agents = LinkedAgentsSettings(linked_agents_path)
         self.auth_status = "Checking login…"
         self.auth_state = "unknown"
         self.auth_pending = False
@@ -1252,6 +1337,19 @@ class SwarmApplication(Gtk.Application):
         self.usage_generation = 0
         self.usage_cancel = None
         self.usage_poll = 0
+
+    def set_linked_agent_enabled(self, harness, enabled):
+        try:
+            self.linked_agents.set_enabled(harness, enabled)
+        except OSError as error:
+            self.linked_agents.load_error = f"Could not save Linked Agents settings: {error}"
+            saved = False
+        else:
+            saved = True
+        for window in self.get_windows():
+            if isinstance(window, SwarmWindow) and not window.closing and window.linked_agents_dialog is not None:
+                window.linked_agents_dialog.refresh()
+        return saved
 
     def do_startup(self):
         Gtk.Application.do_startup(self)

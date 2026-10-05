@@ -13,6 +13,7 @@ from unittest.mock import PropertyMock, patch
 from swarm_app.app import BroadcastDialog, Gdk, Gtk, SwarmApplication
 from swarm_app.codex_detection import DetectedCodex
 from swarm_app.session import TerminalSession
+from gtk_test_support import shutdown_application
 from test_session import FIXTURE, process_alive, pump_until
 
 
@@ -27,7 +28,7 @@ class WindowTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.app.release()
-        cls.app.quit()
+        shutdown_application(cls.app)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -530,6 +531,80 @@ class WindowTests(unittest.TestCase):
         session.terminal.feed(f"\x1b]0;{title}\x07".encode())
         pump_until(lambda: session.terminal.get_window_title() == title)
         session.refresh_activity()
+
+    def test_interrupt_all_agents_menu_order_and_sensitivity(self):
+        item = self.window.interrupt_all_agents_item
+        menu_items = item.get_parent().get_children()
+        self.assertIs(menu_items[menu_items.index(item) + 1], self.window.kill_all_agents_item)
+        self.assertEqual(item.get_label().replace("_", ""), "Interrupt All Agents")
+        self.assertFalse(item.get_sensitive())
+        self.add(kind="shell")
+        self.add(kind="login")
+        self.add(mode="exit")
+        with patch.object(TerminalSession, "start"):
+            starting = self.window.add_session("Starting", "agent", [], str(self.directory))
+        self.sessions.append(starting)
+        self.assertFalse(item.get_sensitive())
+        agent, _folder = self.add()
+        self.assertTrue(item.get_sensitive())
+        os.kill(agent.pid, signal.SIGTERM)
+        pump_until(lambda: agent.state == "exited")
+        self.assertFalse(item.get_sensitive())
+        self.assertTrue(self.window.kill_all_agents_item.get_sensitive())
+        with patch.object(self.window, "confirm") as confirm:
+            self.window.interrupt_all_agents()
+        confirm.assert_not_called()
+
+    def test_interrupt_all_agents_sends_escape_only_in_current_window_and_keeps_tabs(self):
+        busy, busy_folder = self.add()
+        idle, idle_folder = self.add()
+        self.activity_title(busy, "Working")
+        self.activity_title(idle, "Ready")
+        shell, shell_folder = self.add(kind="shell")
+        login, login_folder = self.add(kind="login")
+        exited, _folder = self.add(mode="exit")
+        manual, manual_folder = self.add(kind="shell")
+        process = manual._process
+        detected = DetectedCodex(process.pid, process.start, process.session, process.group, str(manual_folder))
+        other_window = self.app.new_window(start_terminal=False)
+        self.windows.append(other_window)
+        other, other_folder = self.add(other_window)
+        original_tabs = self.window.sessions[:]
+        self.window.notebook.set_current_page(self.window.notebook.page_num(shell))
+        with patch.object(manual, "_foreground_codex", return_value=detected):
+            with patch.object(self.window, "confirm") as confirm:
+                self.window.interrupt_all_agents_item.activate()
+            confirm.assert_not_called()
+            pump_until(lambda: all((folder / "input").read_bytes() == b"\x1b"
+                                  for folder in (busy_folder, idle_folder, manual_folder)))
+            self.assertTrue(manual.is_detected_agent)
+        for folder in (shell_folder, login_folder, other_folder):
+            self.assertEqual((folder / "input").read_bytes(), b"")
+        self.assertEqual(self.window.sessions, original_tabs)
+        self.assertEqual(self.window.notebook.get_n_pages(), len(original_tabs))
+        self.assertIs(self.window.current(), shell)
+        self.assertEqual(other_window.sessions, [other])
+        for session in (busy, idle, manual, shell, login, other):
+            self.assertEqual(session.state, "running")
+            self.assertTrue(process_alive(session.pid))
+        self.assertEqual(exited.state, "exited")
+        self.assertTrue(self.window.interrupt_all_agents_item.get_sensitive())
+
+    def test_interrupt_all_agents_cancels_completion_notification(self):
+        agent, folder = self.add()
+        self.activity_title(agent, "Ready")
+        with patch("swarm_app.app.notify_agents_finished") as notify:
+            watch = self.notifying_broadcast()
+            self.activity_title(agent, "Working")
+            self.assertEqual(watch.started, {agent})
+            self.window.interrupt_all_agents()
+            pump_until(lambda: (folder / "input").read_bytes().endswith(b"\x1b"))
+            self.activity_title(agent, "Ready")
+            self.window._check_broadcast_notifications()
+            with patch("swarm_app.app.time.monotonic", return_value=time.monotonic() + 2):
+                self.window._check_broadcast_notifications()
+            notify.assert_not_called()
+        self.assertEqual(self.window.broadcast_watches, [])
 
     def test_kill_all_agents_is_disabled_without_agent_tabs(self):
         self.assertFalse(self.window.kill_all_agents_item.get_sensitive())
