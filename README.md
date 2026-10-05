@@ -11,9 +11,11 @@ You need Debian 12 or newer with a graphical desktop and [Codex CLI](https://lea
 From the SWARM source folder, install the desktop dependencies and launch it:
 
 ```sh
-sudo apt install python3 python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91
+./install.sh
 ./swarm
 ```
+
+The installer refreshes apt package lists and installs Python 3, PyGObject, GTK 3, and VTE. It uses `sudo` when needed and can be run again to ensure the dependencies are installed. Codex CLI is installed separately.
 
 SWARM uses `/usr/bin/python3` and requires VTE 0.68 or newer. No virtual environment is needed.
 
