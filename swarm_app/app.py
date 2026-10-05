@@ -258,6 +258,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.agent_number = 0
         self.terminal_number = 0
         self.workspace_session = None
+        self.startup_terminal = None
+        self._startup_swarm = []
         self.directory_poll = 0
         self.font_size = 11
         self.is_fullscreen = False
@@ -289,6 +291,9 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.connect("window-state-event", self._window_state)
         self.accels = Gtk.AccelGroup()
         self.add_accel_group(self.accels)
+        for shortcut in ("<Primary>t", "<Primary><Shift>t"):
+            key, mods = Gtk.accelerator_parse(shortcut)
+            self.accels.connect(key, mods, Gtk.AccelFlags.VISIBLE, self._new_agent_shortcut)
 
         layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(layout)
@@ -519,7 +524,6 @@ class SwarmWindow(Gtk.ApplicationWindow):
         session = menu("_Session")
         item(session, "New _Terminal", self.new_terminal, "<Primary><Shift>Return")
         item(session, "New _Window", self.new_window, "<Primary><Shift>n")
-        item(session, "Open Terminal in _Folder…", self.choose_folder)
         separator(session)
         self.account_item = item(session, "Sign in with _ChatGPT", self.account_action)
         self.device_login_item = item(session, "Sign in with _Device Code", lambda: self.login(True))
@@ -531,7 +535,6 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
         swarm = menu("S_warm")
         self.open_swarm_item = item(swarm, "_Open Swarm", self.open_swarm)
-        item(swarm, "_New Agent", self.new_agent, "<Primary><Shift>t")
         separator(swarm)
         self.global_item = item(swarm, "_Global Broadcast…", self.open_broadcast, "<Primary><Shift>b")
         self.sleeper_item = item(swarm, "_Sleeper Broadcast…", self.open_sleeper_broadcast)
@@ -575,19 +578,28 @@ class SwarmWindow(Gtk.ApplicationWindow):
                      "with --codex /path/to/codex. You can also turn Codex off in Actions → Linked Agents.")
         return None
 
+    def _new_agent_shortcut(self, *_):
+        self.new_agent()
+        return True
+
     def new_agent(self):
-        if self.app.logout_pending:
+        if self.closing:
+            return
+        source = self.current()
+        harness = source.harness if source is not None and source.kind == "agent" else "codex"
+        if harness == "codex" and self.app.logout_pending:
             self.flash("Wait for sign-out to finish before opening an agent")
             return
-        executable = self.resolve_codex()
+        executable = self.resolve_harness(harness)
         if not executable:
             return
         directory = self._directory_for_new_session()
         if directory is None:
             return
         self.agent_number += 1
-        return self.add_session(f"Agent {self.agent_number}", "agent", codex_agent_command(executable),
-                                directory, managed_activity_title=True)
+        argv = codex_agent_command(executable) if harness == "codex" else [executable]
+        return self.add_session(f"{HARNESS_NAMES[harness]} {self.agent_number}", "agent", argv,
+                                directory, managed_activity_title=harness == "codex", harness=harness)
 
     def open_linked_agents(self):
         if self.closing:
@@ -635,7 +647,24 @@ class SwarmWindow(Gtk.ApplicationWindow):
             argv = codex_agent_command(executable) if harness == "codex" else [executable]
             sessions.append(self.add_session(f"{HARNESS_NAMES[harness]} {self.agent_number}", "agent", argv,
                                              directory, managed_activity_title=harness == "codex", harness=harness))
+        if self.startup_terminal in self.sessions and self.startup_terminal.is_idle_shell:
+            self._startup_swarm = sessions
+            self._close_startup_terminal_after_swarm()
         return sessions
+
+    def _close_startup_terminal_after_swarm(self):
+        if not self._startup_swarm:
+            return
+        if any(session not in self.sessions or session.state in ("failed", "exited", "closed")
+               for session in self._startup_swarm):
+            self._startup_swarm = []
+            return
+        if any(session.state != "running" for session in self._startup_swarm):
+            return
+        self._startup_swarm = []
+        terminal = self.startup_terminal
+        if terminal in self.sessions and terminal.is_idle_shell:
+            self.close_session(terminal, confirm=False)
 
     def new_terminal(self, directory=None):
         directory = self._directory_for_new_session(directory, recover=True)
@@ -667,7 +696,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
                         self.flash(f"Current folder unavailable; opening in {candidate}")
                         return candidate
             self.message("Working folder is unavailable",
-                         "Use cd to enter an existing folder, or choose Session → Open Terminal in Folder.")
+                         "Use cd to enter an existing folder, or open a new shell with Session → New Terminal.")
             return None
         return directory
 
@@ -817,6 +846,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
             self.set_title(f"{session.title} — SWARM")
         self._update_status()
         self._check_broadcast_notifications()
+        self._close_startup_terminal_after_swarm()
 
     def _move_newly_idle_agent(self, session):
         if not session.agent_idle:
@@ -1078,15 +1108,6 @@ class SwarmWindow(Gtk.ApplicationWindow):
             notify_agents_finished(count, on_error=lambda _error: self.flash(
                 "Agents finished, but the desktop notification could not be shown"))
 
-    def choose_folder(self):
-        dialog = Gtk.FileChooserDialog(title="Open Terminal in Folder", transient_for=self,
-                                       action=Gtk.FileChooserAction.SELECT_FOLDER)
-        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open Terminal", Gtk.ResponseType.OK)
-        dialog.set_current_folder(self.working_directory() or str(Path.home()))
-        if dialog.run() == Gtk.ResponseType.OK:
-            self.new_terminal(dialog.get_filename())
-        dialog.destroy()
-
     def rename_current(self):
         session = self.current()
         if not session or session.kind != "agent":
@@ -1170,6 +1191,11 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if confirm and session.state in ("starting", "running"):
             if not self.confirm(f"Close {session.title}?", "This will stop the session running in this tab.", "Close Tab"):
                 return
+        if session is self.startup_terminal:
+            self.startup_terminal = None
+            self._startup_swarm = []
+        elif session in self._startup_swarm:
+            self._startup_swarm = []
         self.sessions.remove(session)
         self.broadcast_watches = [watch for watch in self.broadcast_watches if session not in watch.recipients]
         self.last_states.pop(session, None)
@@ -1257,8 +1283,10 @@ class SwarmWindow(Gtk.ApplicationWindow):
                      "3. Click Open Swarm to open each enabled harness.\n"
                      "4. Swarm → Global Broadcast (Ctrl+Shift+B).\n\n"
                      "Install and sign in to each CLI separately. Session sign-in and the usage badge "
-                     "are for Codex. Swarm → New Agent (Ctrl+Shift+T) opens an extra Codex tab.\n\n"
-                     "New Agent uses the current terminal folder. Open another shell with "
+                     "are for Codex. Ctrl+T opens a new agent using the selected agent tab's harness "
+                     "and folder: Hermes from Hermes, Codex from Codex. From a shell or with no agent "
+                     "selected, it opens Codex. Ctrl+Shift+T does the same.\n\n"
+                     "Open another shell with "
                      "Session → New Terminal (Ctrl+Shift+Enter).\n\n"
                      "Codex started in a terminal automatically becomes an agent tab while it "
                      "runs in the foreground, then returns to a terminal when the shell returns. "
@@ -1266,10 +1294,12 @@ class SwarmWindow(Gtk.ApplicationWindow):
                      "tabs are excluded. Complete Codex’s "
                      "startup prompts first and leave each harness’s message input empty. Busy sessions handle "
                      "the submitted input according to that harness’s normal behavior.\n\n"
-                     "Swarm → New Agent runs codex --yolo, with approvals and sandboxing disabled. "
+                     "New Codex tabs run codex --yolo, with approvals and sandboxing disabled. "
+                     "New Hermes tabs run hermes using its own configuration. "
                      "Manually started Codex keeps the options you supplied. "
                      "Sleeper Broadcast submits only to agents ready for a new message, skipping "
-                     "working agents and those with unavailable status. New Agent supplies this status; "
+                     "working agents and those with unavailable status. Codex opened with Ctrl+T "
+                     "or Open Swarm supplies this status; "
                      "manually launched agents without it are skipped. Custom Broadcast lets you "
                      "choose individual agents, with Select all, Select idle, and Clear selection. "
                      "It sends to the checked agents, including working agents, and remembers your "
@@ -1292,6 +1322,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
     def _destroyed(self, *_):
         self.closing = True
+        self.startup_terminal = None
+        self._startup_swarm = []
         self.broadcast_watches.clear()
         self._cancel_usage_timers()
         self.usage_panel.destroy()
@@ -1389,7 +1421,7 @@ class SwarmApplication(Gtk.Application):
     def new_window(self, directory=None, *, start_terminal=True):
         window = SwarmWindow(self, directory or self.directory)
         if start_terminal:
-            window.new_terminal(window.directory)
+            window.startup_terminal = window.new_terminal(window.directory)
         window.present()
         return window
 

@@ -5,6 +5,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 import shlex
+import signal
 import tempfile
 import time
 import unittest
@@ -227,6 +228,82 @@ class SessionTests(unittest.TestCase):
         expected = b"\x1b[200~Hello Hermes\x1b[201~\r"
         pump_until(lambda: (directory / "input").read_bytes() == expected)
         self.assertEqual(results, [True])
+
+    def test_hermes_native_titles_track_work_without_enabling_codex_readiness(self):
+        session, directory = self.new_session(harness="hermes")
+        self.ready(session, directory)
+        for title, activity in (("⏳ Hermes", True), ("✓ Hermes", False),
+                                ("⏳️ Hermes", True), ("⚠ Awaiting input", False),
+                                ("Ready", None)):
+            with self.subTest(title=title):
+                session.terminal.feed(f"\x1b]0;{title}\x07".encode())
+                pump_until(lambda: session.terminal.get_window_title() == title
+                           and session.activity is activity)
+                self.assertEqual(session.agent_busy, activity is True)
+                self.assertFalse(session.agent_idle)
+                self.assertFalse(session.can_receive_sleeper_broadcast)
+                self.assertFalse(session.activity_finished("⏳ Hermes"))
+
+    def test_hermes_classic_prompt_transitions_follow_terminal_output(self):
+        session, directory = self.new_session(harness="hermes")
+        self.ready(session, directory)
+        rule = "─" * session.terminal.get_column_count()
+        for index, (prompt, activity) in enumerate((("❯ ", False), ("⚕ Thinking...", True),
+                                                  ("⚠ Confirm command", False), ("🔐 Password: ", False),
+                                                  ("❯ ", False))):
+            with self.subTest(prompt=prompt):
+                title = f"Classic prompt {index}"
+                session.terminal.feed(f"\x1b[2J\x1b[H{rule}\r\n{prompt}\x1b]0;{title}\x07".encode())
+                pump_until(lambda: session.terminal.get_window_title() == title)
+                session.refresh_activity()
+                self.assertIs(session.activity, activity)
+                self.assertEqual(session.agent_busy, activity is True)
+                self.assertFalse(session.agent_idle)
+                self.assertFalse(session.can_receive_sleeper_broadcast)
+        session.terminal.feed(f"\x1b[2J\x1b[H{rule}\r\n⚕ \x1b]0;Compact prompt\x07".encode())
+        pump_until(lambda: session.terminal.get_window_title() == "Compact prompt")
+        session.refresh_activity()
+        self.assertTrue(session.agent_busy)
+        # An explicit native title takes precedence over a prompt still being redrawn.
+        session.terminal.feed("\x1b]0;✓ Hermes\x07".encode())
+        pump_until(lambda: session.activity is False)
+
+    def test_hermes_working_indicator_does_not_change_direct_or_broadcast_input(self):
+        session, directory = self.new_session(harness="hermes")
+        self.ready(session, directory)
+        session.terminal.feed("\x1b]0;⏳ Hermes\x07".encode())
+        pump_until(lambda: session.agent_busy)
+        session.terminal.feed_child(b"typed task\r")
+        pump_until(lambda: (directory / "input").read_bytes() == b"typed task\r")
+        self.assertTrue(session.agent_busy)
+        results = []
+        self.assertTrue(session.broadcast("Broadcast task", results.append))
+        expected = b"typed task\r\x1b[200~Broadcast task\x1b[201~\r"
+        pump_until(lambda: results == [True] and (directory / "input").read_bytes() == expected)
+        self.assertTrue(session.agent_busy)
+        session.terminal.feed("\x1b]0;✓ Hermes\x07".encode())
+        pump_until(lambda: session.activity is False)
+
+    def test_hermes_stopped_or_exited_process_clears_working_indicator(self):
+        session, directory = self.new_session(harness="hermes")
+        self.ready(session, directory)
+        session.terminal.feed("\x1b]0;⏳ Hermes\x07".encode())
+        pump_until(lambda: session.agent_busy)
+        os.kill(session.pid, signal.SIGSTOP)
+        try:
+            pump_until(lambda: Path(f"/proc/{session.pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "T")
+            session.refresh_activity()
+            self.assertIsNone(session.activity)
+            self.assertFalse(session.agent_busy)
+        finally:
+            os.kill(session.pid, signal.SIGCONT)
+        pump_until(lambda: Path(f"/proc/{session.pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "T")
+        session.refresh_activity()
+        self.assertTrue(session.agent_busy)
+        os.kill(session.pid, signal.SIGTERM)
+        pump_until(lambda: session.state == "exited")
+        self.assertIsNone(session.activity)
+        self.assertFalse(session.agent_busy)
 
     def test_canonical_startup_input_rejects_broadcast(self):
         session, directory = self.new_session(mode="canonical")

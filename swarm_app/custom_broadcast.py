@@ -25,7 +25,7 @@ def _agent_status(session):
     if session.agent_idle:
         return "Idle"
     if session.activity is False:
-        return "Not ready"
+        return "Not working" if session.harness == "hermes" else "Not ready"
     return "Status unavailable"
 
 
@@ -104,7 +104,7 @@ class CustomBroadcastDialog(Gtk.Dialog):
         self.agent_list = Gtk.ListBox()
         self.agent_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self.agent_list.get_accessible().set_name("Agents for custom broadcast")
-        empty = _label("No agents are open in this window.\nOpen one with Swarm → New Agent.",
+        empty = _label("No agents are open in this window.\nClick Open Swarm to open agents.",
                        muted=True)
         empty.set_line_wrap(True)
         empty.set_justify(Gtk.Justification.CENTER)

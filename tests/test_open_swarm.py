@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -60,6 +61,28 @@ class OpenSwarmTests(unittest.TestCase):
     def executable(command):
         return {"/test/swarm-codex": "/test/swarm-codex",
                 "/test/swarm-hermes": "/test/swarm-hermes"}.get(command)
+
+    def startup_window(self):
+        with patch.object(self.app, "shell_command", return_value=["/bin/bash", "--noprofile", "--norc", "-i"]), \
+                patch.dict(os.environ, {"HISTFILE": "/dev/null", "INPUTRC": "/dev/null"}):
+            window = self.app.new_window()
+        self.windows.append(window)
+        shell = window.current()
+        pump_until(lambda: shell.state == "running" and shell.working_directory() == str(self.directory))
+        return window, shell
+
+    def harness_executables(self):
+        executables = {}
+        for harness in ("codex", "hermes"):
+            executable = self.directory / harness
+            executable.write_text(
+                "#!/usr/bin/python3\nimport json, sys, time\nfrom pathlib import Path\n"
+                "Path(__file__).with_suffix('.launch').write_text("
+                "json.dumps({'cwd': str(Path.cwd()), 'argv': sys.argv[1:]}))\n"
+                "time.sleep(60)\n")
+            executable.chmod(0o755)
+            executables[harness] = executable
+        return executables
 
     def test_open_swarm_creates_one_agent_for_each_enabled_harness(self):
         with patch("swarm_app.app.shutil.which", side_effect=self.executable), \
@@ -174,6 +197,81 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual(shell.state, "running")
         self.assertIn(shell, self.window.sessions)
 
+    def test_open_swarm_closes_startup_terminal_after_launching_in_its_navigated_folder(self):
+        window, shell = self.startup_window()
+        project = self.directory / "project with spaces 日本語"
+        project.mkdir()
+        shell.terminal.feed_child(("cd -- " + shlex.quote(str(project)) + "\n").encode())
+        pump_until(lambda: shell.working_directory() == str(project))
+        executables = self.harness_executables()
+        with patch.object(self.app, "codex", str(executables["codex"])), \
+                patch.object(self.app, "hermes", str(executables["hermes"])):
+            sessions = window.open_swarm()
+        pump_until(lambda: shell.state == "closed" and all(
+            executable.with_suffix(".launch").exists() for executable in executables.values()))
+        self.assertEqual(window.sessions, sessions)
+        self.assertEqual(window.notebook.get_n_pages(), 2)
+        self.assertIn(window.current(), sessions)
+        for session in sessions:
+            launch = json.loads(executables[session.harness].with_suffix(".launch").read_text())
+            self.assertEqual(launch["cwd"], str(project))
+            self.assertEqual(session.directory, str(project))
+            self.assertEqual(session.state, "running")
+        pump_until(lambda: not process_alive(shell.pid))
+
+    def test_failed_swarm_spawn_preserves_startup_terminal(self):
+        window, shell = self.startup_window()
+        executables = self.harness_executables()
+        executables["hermes"].write_text("#!/missing/swarm-test-interpreter\n")
+        with patch.object(self.app, "codex", str(executables["codex"])), \
+                patch.object(self.app, "hermes", str(executables["hermes"])):
+            sessions = window.open_swarm()
+        pump_until(lambda: sessions[0].state == "running" and sessions[1].state == "failed")
+        self.assertIn(shell, window.sessions)
+        self.assertEqual(shell.state, "running")
+        self.assertTrue(process_alive(shell.pid))
+        self.assertEqual(window.notebook.get_n_pages(), 3)
+
+    def test_open_swarm_preserves_startup_terminal_with_foreground_or_background_job(self):
+        executables = self.harness_executables()
+        for background in (False, True):
+            with self.subTest(background=background):
+                window, shell = self.startup_window()
+                if background:
+                    marker = self.directory / "background-job.pid"
+                    command = "/bin/sleep 60 & printf '%s' $! > " + shlex.quote(str(marker))
+                    shell.terminal.feed_child((command + "\n").encode())
+                    pump_until(lambda: marker.exists() and bool(marker.read_text()))
+                    job_pid = int(marker.read_text())
+                    pump_until(lambda: os.tcgetpgrp(shell.terminal.get_pty().get_fd()) == shell.pid)
+                else:
+                    shell.terminal.feed_child(b"/bin/sleep 60\n")
+                    pump_until(lambda: os.tcgetpgrp(shell.terminal.get_pty().get_fd()) != shell.pid)
+                    job_pid = os.tcgetpgrp(shell.terminal.get_pty().get_fd())
+                with patch.object(self.app, "codex", str(executables["codex"])), \
+                        patch.object(self.app, "hermes", str(executables["hermes"])):
+                    sessions = window.open_swarm()
+                pump_until(lambda: all(session.state == "running" for session in sessions))
+                self.assertIn(shell, window.sessions)
+                self.assertEqual(shell.state, "running")
+                self.assertTrue(process_alive(job_pid))
+
+    def test_open_swarm_removes_only_startup_terminal_and_keeps_extra_terminal(self):
+        window, startup = self.startup_window()
+        with patch.object(self.app, "shell_command", return_value=["/bin/bash", "--noprofile", "--norc", "-i"]):
+            extra = window.new_terminal()
+        pump_until(lambda: extra.state == "running")
+        window.notebook.set_current_page(window.notebook.page_num(startup))
+        executables = self.harness_executables()
+        with patch.object(self.app, "codex", str(executables["codex"])), \
+                patch.object(self.app, "hermes", str(executables["hermes"])):
+            sessions = window.open_swarm()
+        pump_until(lambda: startup.state == "closed")
+        self.assertEqual(window.sessions, [extra, *sessions])
+        self.assertEqual(extra.state, "running")
+        self.assertTrue(process_alive(extra.pid))
+        pump_until(lambda: not process_alive(startup.pid))
+
     def test_open_swarm_button_and_menu_activate_the_same_action(self):
         self.assertIsInstance(self.window.open_swarm_button, Gtk.Button)
         self.assertTrue(self.window.open_swarm_button.get_visible())
@@ -263,6 +361,132 @@ class OpenSwarmTests(unittest.TestCase):
             session = self.window.new_agent()
         self.assertEqual(session.harness, "codex")
         start.assert_called_once_with(codex_agent_command("/test/swarm-codex"))
+
+    def test_new_agent_shortcuts_match_selected_swarm_harness_and_folder(self):
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable), \
+                patch.object(TerminalSession, "start"):
+            originals = self.window.open_swarm()
+        for original in originals:
+            folder = self.directory / (original.harness + " project 日本語")
+            folder.mkdir()
+            original.directory = str(folder)
+        for shortcut in ("<Primary>t", "<Primary><Shift>t"):
+            for original in originals:
+                with self.subTest(shortcut=shortcut, harness=original.harness):
+                    self.window.notebook.set_current_page(self.window.notebook.page_num(original))
+                    before = list(self.window.sessions)
+                    with patch("swarm_app.app.shutil.which", side_effect=self.executable) as resolve, \
+                            patch.object(TerminalSession, "start", autospec=True) as start:
+                        key, modifiers = Gtk.accelerator_parse(shortcut)
+                        activated = Gtk.accel_groups_activate(self.window, key, modifiers)
+                    self.assertTrue(activated)
+                    session = self.window.current()
+                    self.assertEqual(self.window.sessions, [*before, session])
+                    self.assertNotIn(session, before)
+                    self.assertEqual(self.window.notebook.get_n_pages(), len(before) + 1)
+                    self.assertEqual(session.harness, original.harness)
+                    self.assertEqual(session.kind, "agent")
+                    self.assertEqual(session.directory, original.directory)
+                    self.assertEqual(session.managed_activity_title, original.harness == "codex")
+                    executable = getattr(self.app, original.harness)
+                    resolve.assert_called_once_with(executable)
+                    command = codex_agent_command(executable) if original.harness == "codex" else [executable]
+                    start.assert_called_once_with(session, command)
+
+    def test_new_agent_shortcut_matches_exited_agent_even_when_unlinked(self):
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable), \
+                patch.object(TerminalSession, "start"):
+            originals = self.window.open_swarm()
+        self.app.set_linked_agent_enabled("codex", False)
+        self.app.set_linked_agent_enabled("hermes", False)
+        for original in originals:
+            with self.subTest(harness=original.harness):
+                original.state = "exited"
+                original.title = "Research assistant"
+                self.window.notebook.set_current_page(self.window.notebook.page_num(original))
+                before = list(self.window.sessions)
+                with patch("swarm_app.app.shutil.which", side_effect=self.executable) as resolve, \
+                        patch.object(TerminalSession, "start") as start:
+                    key, modifiers = Gtk.accelerator_parse("<Primary>t")
+                    self.assertTrue(Gtk.accel_groups_activate(self.window, key, modifiers))
+                session = self.window.current()
+                self.assertEqual(self.window.sessions, [*before, session])
+                self.assertEqual(session.harness, original.harness)
+                self.assertEqual(session.directory, original.directory)
+                executable = getattr(self.app, original.harness)
+                resolve.assert_called_once_with(executable)
+                command = codex_agent_command(executable) if original.harness == "codex" else [executable]
+                start.assert_called_once_with(command)
+
+    def test_codex_logout_blocks_codex_shortcut_but_allows_hermes_shortcut(self):
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable), \
+                patch.object(TerminalSession, "start"):
+            codex, hermes = self.window.open_swarm()
+        self.app.logout_pending = True
+        key, modifiers = Gtk.accelerator_parse("<Primary>t")
+        self.window.notebook.set_current_page(self.window.notebook.page_num(codex))
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable) as resolve, \
+                patch.object(TerminalSession, "start") as start:
+            self.assertTrue(Gtk.accel_groups_activate(self.window, key, modifiers))
+            self.assertEqual(self.window.sessions, [codex, hermes])
+            resolve.assert_not_called()
+            start.assert_not_called()
+            self.window.notebook.set_current_page(self.window.notebook.page_num(hermes))
+            self.assertTrue(Gtk.accel_groups_activate(self.window, key, modifiers))
+        session = self.window.current()
+        self.assertEqual(self.window.sessions, [codex, hermes, session])
+        self.assertEqual(session.harness, "hermes")
+        resolve.assert_called_once_with(self.app.hermes)
+        start.assert_called_once_with(["/test/swarm-hermes"])
+
+    def test_ctrl_t_from_terminal_defaults_to_codex(self):
+        with patch.object(TerminalSession, "start"):
+            shell = self.window.new_terminal()
+        self.app.set_linked_agent_enabled("codex", False)
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable) as resolve, \
+                patch.object(TerminalSession, "start") as start:
+            key, modifiers = Gtk.accelerator_parse("<Primary>t")
+            self.assertTrue(Gtk.accel_groups_activate(self.window, key, modifiers))
+        session = self.window.current()
+        self.assertEqual(self.window.sessions, [shell, session])
+        self.assertEqual(session.harness, "codex")
+        self.assertEqual(session.directory, shell.directory)
+        resolve.assert_called_once_with(self.app.codex)
+        start.assert_called_once_with(codex_agent_command("/test/swarm-codex"))
+
+    def test_mixed_swarm_spinners_and_shared_total_follow_both_harnesses(self):
+        sessions = {}
+        for harness in ("codex", "hermes"):
+            folder = self.directory / harness
+            folder.mkdir()
+            session = self.window.add_session(
+                harness.title(), "agent", ["/usr/bin/python3", str(FIXTURE), str(folder)],
+                str(folder), managed_activity_title=harness == "codex", harness=harness)
+            pump_until(lambda: session.state == "running" and (folder / "input").exists())
+            sessions[harness] = session
+        codex, hermes = sessions["codex"], sessions["hermes"]
+        codex.terminal.feed(b"\x1b]0;Working\x07")
+        rule = "─" * hermes.terminal.get_column_count()
+        hermes.terminal.feed(f"\x1b[2J\x1b[H{rule}\r\n⚕ Thinking...".encode())
+        # The normal window poll must observe classic Hermes prompt redraws.
+        pump_until(lambda: self.window.status_label.get_text() == "2 agents · 2 running")
+        for session in sessions.values():
+            spinner = self.window.tab_spinners[session]
+            self.assertTrue(spinner.get_visible())
+            self.assertTrue(spinner.get_property("active"))
+        hermes.terminal.feed("\x1b]0;✓ Hermes\x07".encode())
+        pump_until(lambda: self.window.status_label.get_text() == "2 agents · 1 running")
+        self.assertFalse(self.window.tab_spinners[hermes].get_visible())
+        self.assertFalse(self.window.tab_spinners[hermes].get_property("active"))
+        self.assertTrue(self.window.tab_spinners[codex].get_visible())
+        hermes.terminal.feed("\x1b]0;⏳ Hermes\x07".encode())
+        pump_until(lambda: self.window.status_label.get_text() == "2 agents · 2 running")
+        self.assertTrue(self.window.tab_spinners[hermes].get_visible())
+        os.kill(hermes.pid, signal.SIGTERM)
+        pump_until(lambda: self.window.status_label.get_text() == "1 agent · 1 running")
+        self.assertEqual(hermes.state, "exited")
+        self.assertFalse(self.window.tab_spinners[hermes].get_visible())
+        self.assertFalse(self.window.tab_spinners[hermes].get_property("active"))
 
     def test_mixed_swarm_broadcasts_work_without_codex_only_finish_notifications(self):
         folders = []

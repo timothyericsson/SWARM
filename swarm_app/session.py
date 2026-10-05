@@ -25,7 +25,7 @@ gi.require_version("Vte", "2.91")
 from gi.repository import Gio, GLib, Gtk, Vte
 
 from .codex_detection import DetectedCodex, find_foreground_codex
-from .activity import title_activity, title_finished, title_is_ready
+from .activity import hermes_prompt_activity, hermes_title_activity, title_activity, title_finished, title_is_ready
 
 
 MAX_MESSAGE_BYTES = 64 * 1024
@@ -236,9 +236,6 @@ class TerminalSession(Gtk.Box):
         return not self.managed_activity_title or self._read_activity() is False
 
     def _read_activity(self) -> bool | None:
-        # Hermes does not expose the Codex title protocol used by this reader.
-        if self.harness != "codex":
-            return None
         if self.kind != "agent" or self.state != "running" or self._process is None:
             return None
         if self.origin_kind == "shell" and self._detected_codex is None:
@@ -247,7 +244,38 @@ class TerminalSession(Gtk.Box):
         if (current is None or current.start != self._process.start
                 or current.state in {"Z", "X", "x", "T", "t"}):
             return None
+        if self.harness == "hermes":
+            return self._read_hermes_activity()
         return title_activity(self.terminal.get_window_title(), managed=self.managed_activity_title)
+
+    def _read_hermes_activity(self) -> bool | None:
+        activity = hermes_title_activity(self.terminal.get_window_title())
+        if activity is not None:
+            return activity
+        # Classic Hermes keeps its composer at the live cursor, including
+        # while tools run. Use absolute terminal rows so scrolling back does
+        # not revive an old busy prompt. Its input area is at most eight rows.
+        pty = self.terminal.get_pty()
+        if pty is None:
+            return None
+        try:
+            if termios.tcgetattr(pty.get_fd())[3] & (termios.ICANON | termios.ECHO):
+                return None
+        except (OSError, termios.error):
+            return None
+        _column, row = self.terminal.get_cursor_position()
+        columns = self.terminal.get_column_count()
+        screen_start = max(0, int(self.terminal.get_vadjustment().get_upper()) - self.terminal.get_row_count())
+        read_range = getattr(self.terminal, "get_text_range_format", None)
+        lines = []
+        for line in range(max(screen_start, row - 9), row + 1):
+            if read_range is not None:
+                text, _length = read_range(Vte.Format.TEXT, line, 0, line, columns)
+            else:
+                # Debian 12's VTE 0.70 predates get_text_range_format.
+                text, _attributes = self.terminal.get_text_range(line, 0, line, columns, None, None)
+            lines.append((text or "").rstrip("\r\n"))
+        return hermes_prompt_activity(lines, columns=columns)
 
     def refresh_activity(self) -> None:
         activity = self._read_activity()
@@ -295,6 +323,26 @@ class TerminalSession(Gtk.Box):
             if Path(executable).name in {"sh", "bash", "dash", "zsh", "fish", "ksh", "ksh93", "csh", "tcsh", "nu", "elvish"}:
                 self._shell_executable = identity
             return identity == self._shell_executable
+        except OSError:
+            return False
+
+    @property
+    def is_idle_shell(self) -> bool:
+        """Whether closing this terminal would stop only its waiting shell."""
+        if self.origin_kind != "shell" or self.kind != "shell" or self.state != "running":
+            return False
+        leader = self._process
+        if leader is None or leader.session != leader.pid or not self._shell_is_alive():
+            return False
+        pty = self.terminal.get_pty()
+        if pty is None:
+            return False
+        try:
+            if os.tcgetpgrp(pty.get_fd()) != leader.group:
+                return False
+            if any(process.pid != leader.pid for process in _session_processes(leader)):
+                return False
+            return os.tcgetpgrp(pty.get_fd()) == leader.group and self._shell_is_alive()
         except OSError:
             return False
 

@@ -1,9 +1,11 @@
-"""Interpret Codex's terminal-title activity, independently of process liveness.
+"""Interpret terminal activity signals, independently of process liveness.
 
-The TUI emits these title updates over OSC; VTE exposes them through its
-window-title property. No conversation text or saved conversations are read.
+Codex and Hermes Ink emit OSC titles exposed by VTE's window-title property.
+Classic Hermes exposes its state in the live composer prompt instead.
 Unknown activity stays quiet, rather than making an idle CLI look busy.
 """
+
+import re
 
 
 # Codex TUI terminal-title spinner frames (including its disabled-animation
@@ -14,6 +16,50 @@ ACTIVITY_TITLE_CONFIG = 'tui.terminal_title=["spinner","status"]'
 
 def codex_agent_command(executable: str) -> list[str]:
     return [executable, "--yolo", "-c", ACTIVITY_TITLE_CONFIG]
+
+
+def hermes_title_activity(title: str | None) -> bool | None:
+    """Read Hermes Ink's leading busy/idle/attention title marker."""
+    if not isinstance(title, str):
+        return None
+    text = title.strip().replace("\ufe0f", "")
+    marker, _, _suffix = text.partition(" ")
+    if marker == "⏳":
+        return True
+    if marker in {"✓", "⚠"}:
+        return False
+    return None
+
+
+def hermes_prompt_activity(lines: list[str], *, columns: int) -> bool | None:
+    """Read classic Hermes's live composer, never past prompts in scrollback.
+
+    Callers supply physical rows ending at the live cursor. The full-width
+    input rule anchors the prompt; markers elsewhere in output or draft text
+    are not activity signals. Unknown/custom layouts stay unavailable.
+    """
+    if columns < 2:
+        return None
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].rstrip() != "─" * columns:
+            continue
+        prompt_rows = lines[index + 1:]
+        while prompt_rows and prompt_rows[0].strip().startswith("[📎 ") and prompt_rows[0].rstrip().endswith("]"):
+            prompt_rows = prompt_rows[1:]
+        if not prompt_rows:
+            return None
+        prompt = prompt_rows[0].strip().replace("\ufe0f", "")
+        marker, _, _suffix = prompt.partition(" ")
+        if marker == "⚕":
+            return True
+        if marker in {"⚠", "🔐", "🔑", "✎", "?", "🎤", "●", "◉"}:
+            return False
+        # The default prompt is ❯; profiles can prepend their name. Other
+        # common prompt arrows come from Hermes's skin settings.
+        if re.match(r"^(?:[\w.-]+\s+)?[❯>$#›»→](?:\s|$)", prompt):
+            return False
+        return None
+    return None
 
 
 def title_is_ready(title: str | None, *, managed: bool = False) -> bool:
