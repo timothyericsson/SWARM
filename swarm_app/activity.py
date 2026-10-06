@@ -18,6 +18,10 @@ def codex_agent_command(executable: str) -> list[str]:
     return [executable, "--yolo", "-c", ACTIVITY_TITLE_CONFIG]
 
 
+def hermes_agent_command(executable: str) -> list[str]:
+    return [executable, "--yolo"]
+
+
 def hermes_title_activity(title: str | None) -> bool | None:
     """Read Hermes Ink's leading busy/idle/attention title marker."""
     if not isinstance(title, str):

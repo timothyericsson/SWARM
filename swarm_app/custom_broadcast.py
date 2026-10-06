@@ -25,7 +25,7 @@ def _agent_status(session):
     if session.agent_idle:
         return "Idle"
     if session.activity is False:
-        return "Not working" if session.harness == "hermes" else "Not ready"
+        return session.spec.not_ready_status
     return "Status unavailable"
 
 

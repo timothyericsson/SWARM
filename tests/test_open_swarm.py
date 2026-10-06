@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from swarm_app.activity import codex_agent_command
+from swarm_app.activity import codex_agent_command, hermes_agent_command
 from swarm_app.app import Gtk, SwarmApplication
 from swarm_app.linked_agents import LinkedAgentsSettings
 from swarm_app.session import TerminalSession
@@ -98,7 +98,7 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual(start.call_args_list[0].args,
                          (sessions[0], codex_agent_command("/test/swarm-codex")))
         self.assertEqual(start.call_args_list[1].args,
-                         (sessions[1], ["/test/swarm-hermes"]))
+                         (sessions[1], hermes_agent_command("/test/swarm-hermes")))
         self.assertEqual(self.window.notebook.get_n_pages(), 2)
 
     def test_disabling_hermes_launches_only_codex(self):
@@ -117,7 +117,7 @@ class OpenSwarmTests(unittest.TestCase):
             sessions = self.window.open_swarm()
         self.assertEqual([session.harness for session in sessions], ["hermes"])
         resolve.assert_called_once_with(self.app.hermes)
-        start.assert_called_once_with(["/test/swarm-hermes"])
+        start.assert_called_once_with(hermes_agent_command("/test/swarm-hermes"))
 
     def test_disabling_both_explains_empty_selection_and_opens_preferences(self):
         self.app.set_linked_agent_enabled("codex", False)
@@ -332,7 +332,7 @@ class OpenSwarmTests(unittest.TestCase):
             sessions = self.window.open_swarm()
         self.assertEqual([session.harness for session in sessions], ["hermes"])
         resolve.assert_called_once_with(self.app.hermes)
-        start.assert_called_once_with(["/test/swarm-hermes"])
+        start.assert_called_once_with(hermes_agent_command("/test/swarm-hermes"))
 
     def test_hermes_restart_keeps_original_harness_even_when_disabled(self):
         self.app.set_linked_agent_enabled("codex", False)
@@ -352,7 +352,7 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual(replacement.directory, str(self.directory))
         self.assertFalse(replacement.managed_activity_title)
         resolve.assert_called_once_with(self.app.hermes)
-        start.assert_called_once_with(["/test/swarm-hermes"])
+        start.assert_called_once_with(hermes_agent_command("/test/swarm-hermes"))
 
     def test_new_agent_remains_codex_when_linked_codex_is_disabled(self):
         self.app.set_linked_agent_enabled("codex", False)
@@ -390,7 +390,7 @@ class OpenSwarmTests(unittest.TestCase):
                     self.assertEqual(session.managed_activity_title, original.harness == "codex")
                     executable = getattr(self.app, original.harness)
                     resolve.assert_called_once_with(executable)
-                    command = codex_agent_command(executable) if original.harness == "codex" else [executable]
+                    command = codex_agent_command(executable) if original.harness == "codex" else hermes_agent_command(executable)
                     start.assert_called_once_with(session, command)
 
     def test_new_agent_shortcut_matches_exited_agent_even_when_unlinked(self):
@@ -415,7 +415,7 @@ class OpenSwarmTests(unittest.TestCase):
                 self.assertEqual(session.directory, original.directory)
                 executable = getattr(self.app, original.harness)
                 resolve.assert_called_once_with(executable)
-                command = codex_agent_command(executable) if original.harness == "codex" else [executable]
+                command = codex_agent_command(executable) if original.harness == "codex" else hermes_agent_command(executable)
                 start.assert_called_once_with(command)
 
     def test_codex_logout_blocks_codex_shortcut_but_allows_hermes_shortcut(self):
@@ -437,7 +437,7 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual(self.window.sessions, [codex, hermes, session])
         self.assertEqual(session.harness, "hermes")
         resolve.assert_called_once_with(self.app.hermes)
-        start.assert_called_once_with(["/test/swarm-hermes"])
+        start.assert_called_once_with(hermes_agent_command("/test/swarm-hermes"))
 
     def test_ctrl_t_from_terminal_defaults_to_codex(self):
         with patch.object(TerminalSession, "start"):

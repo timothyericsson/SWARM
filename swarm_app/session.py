@@ -25,7 +25,8 @@ gi.require_version("Vte", "2.91")
 from gi.repository import Gio, GLib, Gtk, Vte
 
 from .codex_detection import DetectedCodex, find_foreground_codex
-from .activity import hermes_prompt_activity, hermes_title_activity, title_activity, title_finished, title_is_ready
+from .activity import title_is_ready
+from .harnesses import HARNESSES, HARNESS_ORDER
 
 
 MAX_MESSAGE_BYTES = 64 * 1024
@@ -161,12 +162,14 @@ class TerminalSession(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         if kind not in {"agent", "login", "shell"}:
             raise ValueError("Session kind must be agent, login, or shell.")
-        if harness not in {"codex", "hermes"}:
-            raise ValueError("Agent harness must be Codex or Hermes.")
+        if harness not in HARNESSES:
+            known = ", ".join(spec.name for spec in HARNESS_ORDER)
+            raise ValueError(f"Agent harness must be one of: {known}.")
         self.title = title
         self.kind = kind
         self.origin_kind = kind
         self.harness = harness
+        self.spec = HARNESSES[harness]
         self.managed_activity_title = managed_activity_title
         self.activity: bool | None = None
         self._last_agent_idle = False
@@ -228,12 +231,9 @@ class TerminalSession(Gtk.Box):
 
     def activity_finished(self, busy_title: str | None) -> bool:
         """Read completion without relaxing idle-only broadcast eligibility."""
-        if self.harness != "codex" or self.agent_identity is None:
+        if self.agent_identity is None:
             return False
-        if not title_finished(self.terminal.get_window_title(), busy_title,
-                              managed=self.managed_activity_title):
-            return False
-        return not self.managed_activity_title or self._read_activity() is False
+        return self.spec.activity_finished(self, busy_title)
 
     def _read_activity(self) -> bool | None:
         if self.kind != "agent" or self.state != "running" or self._process is None:
@@ -244,38 +244,7 @@ class TerminalSession(Gtk.Box):
         if (current is None or current.start != self._process.start
                 or current.state in {"Z", "X", "x", "T", "t"}):
             return None
-        if self.harness == "hermes":
-            return self._read_hermes_activity()
-        return title_activity(self.terminal.get_window_title(), managed=self.managed_activity_title)
-
-    def _read_hermes_activity(self) -> bool | None:
-        activity = hermes_title_activity(self.terminal.get_window_title())
-        if activity is not None:
-            return activity
-        # Classic Hermes keeps its composer at the live cursor, including
-        # while tools run. Use absolute terminal rows so scrolling back does
-        # not revive an old busy prompt. Its input area is at most eight rows.
-        pty = self.terminal.get_pty()
-        if pty is None:
-            return None
-        try:
-            if termios.tcgetattr(pty.get_fd())[3] & (termios.ICANON | termios.ECHO):
-                return None
-        except (OSError, termios.error):
-            return None
-        _column, row = self.terminal.get_cursor_position()
-        columns = self.terminal.get_column_count()
-        screen_start = max(0, int(self.terminal.get_vadjustment().get_upper()) - self.terminal.get_row_count())
-        read_range = getattr(self.terminal, "get_text_range_format", None)
-        lines = []
-        for line in range(max(screen_start, row - 9), row + 1):
-            if read_range is not None:
-                text, _length = read_range(Vte.Format.TEXT, line, 0, line, columns)
-            else:
-                # Debian 12's VTE 0.70 predates get_text_range_format.
-                text, _attributes = self.terminal.get_text_range(line, 0, line, columns, None, None)
-            lines.append((text or "").rstrip("\r\n"))
-        return hermes_prompt_activity(lines, columns=columns)
+        return self.spec.read_activity(self)
 
     def refresh_activity(self) -> None:
         activity = self._read_activity()

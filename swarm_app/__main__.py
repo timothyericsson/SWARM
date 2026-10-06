@@ -6,17 +6,20 @@ from pathlib import Path
 import sys
 
 from . import __version__
+from .harnesses import HARNESS_ORDER
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SWARM — a terminal workspace for Codex and Hermes agents")
+    parser = argparse.ArgumentParser(description="SWARM — a terminal workspace for AI agent harnesses")
     parser.add_argument("--version", action="version", version=f"SWARM {__version__}")
     parser.add_argument("--directory", "-C", type=Path, default=Path.home(),
                         help="starting folder for the first terminal (default: your home folder)")
-    parser.add_argument("--codex", default=os.environ.get("SWARM_CODEX", "codex"),
-                        help="Codex executable name or path")
-    parser.add_argument("--hermes", default=os.environ.get("SWARM_HERMES", "hermes"),
-                        help="Hermes executable name or path")
+    # One executable flag per registered harness: --codex, --hermes, …
+    for spec in HARNESS_ORDER:
+        parser.add_argument(f"--{spec.key}",
+                            default=os.environ.get(spec.executable_environment(),
+                                                   spec.default_executable),
+                            help=f"{spec.name} executable name or path")
     args = parser.parse_args()
     directory = args.directory.expanduser().resolve()
     if not directory.is_dir():
@@ -32,7 +35,7 @@ def main():
         print("SWARM needs a graphical desktop. Run it from your Debian desktop terminal.",
               file=sys.stderr)
         return 1
-    return SwarmApplication(str(directory), args.codex, args.hermes).run([sys.argv[0]])
+    return SwarmApplication(str(directory), *(getattr(args, spec.key) for spec in HARNESS_ORDER)).run([sys.argv[0]])
 
 
 if __name__ == "__main__":

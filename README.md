@@ -36,7 +36,7 @@ Click **Open Swarm** in the titlebar, or choose **Swarm > Open Swarm**, to open 
 
 The initial terminal lets you `cd` to your project before opening a swarm. Once all swarm agents have started, that terminal closes automatically if its shell has no running jobs. Extra terminals you open yourself stay open, and a failed swarm launch keeps the initial terminal available.
 
-Codex tabs launch with `codex --yolo`. This disables Codex command approvals and its sandbox; the agent runs with your user account's permissions. Manually launched Codex keeps the options you supplied. Hermes launches with `hermes` and uses its own configuration and sign-in. **Actions > Restart Exited Agent** restarts the tab's original harness.
+Codex tabs launch with `codex --yolo`. This disables Codex command approvals and its sandbox; the agent runs with your user account's permissions. Manually launched Codex keeps the options you supplied. Hermes tabs launch with `hermes --yolo`, which bypasses its dangerous-command approval prompts; it otherwise uses its own configuration and sign-in. **Actions > Restart Exited Agent** restarts the tab's original harness.
 
 Press **Ctrl+T** to open another agent using the selected agent tab's harness and folder: Hermes from a Hermes tab, or Codex from a Codex tab. From a regular terminal or with no agent selected, it opens Codex in the current folder, so you can use `cd` first. **Ctrl+Shift+T** does the same. Linked Agents switches control which harnesses **Open Swarm** opens; the shortcut follows the selected tab even if that harness's switch is off.
 
@@ -115,9 +115,12 @@ Building needs no root access. Remove the package with `sudo apt remove swarm-te
 ## Source
 
 - `swarm`: launcher; `swarm_app/__main__.py`: command-line options.
+- `harnesses.py`: the harness registry. Each harness (Codex, Hermes) is a class
+  holding its launch command, activity readers, and capability flags; adding a
+  harness means adding one class there, with no call-site edits elsewhere.
 - `app.py`: windows, menus, and broadcast controls.
 - `session.py`: terminal sessions and message delivery.
-- `activity.py` and `codex_detection.py`: activity and foreground process detection.
+- `activity.py` and `codex_detection.py`: activity parsing and Codex foreground detection.
 - `custom_broadcast.py`: recipient picker; `usage.py`: account usage queries.
 - `linked_agents.py` and `linked_agents_dialog.py`: saved harness switches and their configuration window.
 - `notifications.py`: desktop completion alerts.

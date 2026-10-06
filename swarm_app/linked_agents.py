@@ -5,8 +5,11 @@ import os
 from pathlib import Path
 import tempfile
 
+from .harnesses import HARNESS_ORDER
 
-HARNESS_NAMES = {"codex": "Codex", "hermes": "Hermes"}
+
+# Display names keyed by harness identifier, in launch order.
+HARNESS_NAMES = {spec.key: spec.name for spec in HARNESS_ORDER}
 
 
 class LinkedAgentsSettings:

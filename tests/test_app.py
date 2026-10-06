@@ -12,6 +12,7 @@ from unittest.mock import PropertyMock, patch
 
 from swarm_app.app import BroadcastDialog, Gdk, Gtk, SwarmApplication
 from swarm_app.codex_detection import DetectedCodex
+from swarm_app.harnesses import CodexHarness
 from swarm_app.session import TerminalSession
 from gtk_test_support import shutdown_application
 from test_session import FIXTURE, process_alive, pump_until
@@ -228,7 +229,7 @@ class WindowTests(unittest.TestCase):
         folder.mkdir()
         argv = ["/usr/bin/python3", str(FIXTURE), str(folder), "record"]
         with patch.object(self.window, "resolve_codex", return_value="/test/codex"), \
-                patch("swarm_app.app.codex_agent_command", return_value=argv) as command:
+                patch.object(CodexHarness, "agent_command", return_value=argv) as command:
             activated = Gtk.accel_groups_activate(
                 self.window, Gdk.KEY_t, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
         self.assertTrue(activated)
