@@ -21,9 +21,9 @@ class LinkedAgentsSettingsTests(unittest.TestCase):
         self.path.parent.mkdir(exist_ok=True)
         self.path.write_text(content, encoding="utf-8")
 
-    def test_first_use_enables_both_without_creating_config(self):
+    def test_first_use_enables_three_without_creating_config(self):
         settings = LinkedAgentsSettings(self.path)
-        self.assertEqual(settings.enabled, {"codex": True, "hermes": True})
+        self.assertEqual(settings.enabled, {"codex": True, "hermes": True, "deepseek": True})
         self.assertIsNone(settings.load_error)
         self.assertFalse(self.path.exists())
 
@@ -31,13 +31,14 @@ class LinkedAgentsSettingsTests(unittest.TestCase):
         settings = LinkedAgentsSettings(self.path)
         settings.set_enabled("hermes", False)
         self.assertEqual(LinkedAgentsSettings(self.path).enabled,
-                         {"codex": True, "hermes": False})
+                         {"codex": True, "hermes": False, "deepseek": True})
         settings.set_enabled("codex", False)
+        settings.set_enabled("deepseek", False)
         self.assertEqual(LinkedAgentsSettings(self.path).enabled,
-                         {"codex": False, "hermes": False})
+                         {"codex": False, "hermes": False, "deepseek": False})
         settings.set_enabled("hermes", True)
         self.assertEqual(json.loads(self.path.read_text()),
-                         {"codex": False, "hermes": True})
+                         {"codex": False, "hermes": True, "deepseek": False})
 
     def test_xdg_config_path_and_home_fallback(self):
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.directory)}):
@@ -53,7 +54,7 @@ class LinkedAgentsSettingsTests(unittest.TestCase):
     def test_missing_harness_defaults_on_and_unknown_keys_are_ignored(self):
         self.write('{"hermes": false, "future-agent": false}')
         settings = LinkedAgentsSettings(self.path)
-        self.assertEqual(settings.enabled, {"codex": True, "hermes": False})
+        self.assertEqual(settings.enabled, {"codex": True, "hermes": False, "deepseek": True})
         self.assertIsNone(settings.load_error)
 
     def test_corrupt_settings_default_on_without_overwriting_file(self):
@@ -78,7 +79,7 @@ class LinkedAgentsSettingsTests(unittest.TestCase):
         settings.set_enabled("hermes", False)
         self.assertIsNone(settings.load_error)
         self.assertEqual(LinkedAgentsSettings(self.path).enabled,
-                         {"codex": True, "hermes": False})
+                         {"codex": True, "hermes": False, "deepseek": True})
 
     def test_invalid_harness_or_boolean_never_writes(self):
         settings = LinkedAgentsSettings(self.path)
@@ -97,7 +98,7 @@ class LinkedAgentsSettingsTests(unittest.TestCase):
         with patch("swarm_app.linked_agents.os.replace", side_effect=OSError("save failed")):
             with self.assertRaisesRegex(OSError, "save failed"):
                 settings.set_enabled("codex", False)
-        self.assertEqual(settings.enabled, {"codex": True, "hermes": False})
+        self.assertEqual(settings.enabled, {"codex": True, "hermes": False, "deepseek": True})
         self.assertEqual(self.path.read_text(), original)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 

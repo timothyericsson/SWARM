@@ -6,7 +6,21 @@ from pathlib import Path
 import tempfile
 
 
-HARNESS_NAMES = {"codex": "Codex", "hermes": "Hermes"}
+HARNESS_NAMES = {"codex": "Codex", "hermes": "GLM-5.3 Flash · Hermes",
+                 "deepseek": "DeepSeek V4.1 Flash · Hermes"}
+
+
+def agent_command(executable, profile):
+    """Choose the model per launch, without changing Hermes' saved default."""
+    if profile == "codex":
+        from .activity import codex_agent_command
+        return codex_agent_command(executable)
+    if profile == "hermes":
+        return [executable, "chat", "--provider", "zai", "--model", "glm-5.3-flash", "--yolo"]
+    if profile == "deepseek":
+        return [executable, "chat", "--provider", "deepseek", "--model", "deepseek-flash",
+                "--reasoning", "max", "--yolo"]
+    raise ValueError(f"Unknown agent profile: {profile}")
 
 
 class LinkedAgentsSettings:

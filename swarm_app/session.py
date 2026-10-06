@@ -157,7 +157,8 @@ def _terminate_processes(leader: _Process | None) -> None:
 
 class TerminalSession(Gtk.Box):
     def __init__(self, title: str, kind: str, directory: str, on_change: Callable,
-                 *, managed_activity_title: bool = False, harness: str = "codex"):
+                 *, managed_activity_title: bool = False, harness: str = "codex",
+                 agent_profile: str | None = None):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         if kind not in {"agent", "login", "shell"}:
             raise ValueError("Session kind must be agent, login, or shell.")
@@ -167,6 +168,7 @@ class TerminalSession(Gtk.Box):
         self.kind = kind
         self.origin_kind = kind
         self.harness = harness
+        self.agent_profile = agent_profile or harness
         self.managed_activity_title = managed_activity_title
         self.activity: bool | None = None
         self._last_agent_idle = False

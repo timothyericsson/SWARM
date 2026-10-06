@@ -30,15 +30,15 @@ If your shell setup adds these commands to `PATH`, launch SWARM from that config
 
 ## Terminals and agents
 
-Choose **Actions > Linked Agents** to turn Codex and Hermes on or off. Both start enabled. Changes are saved immediately in `$XDG_CONFIG_HOME/swarm/linked-agents.json` (normally `~/.config/swarm/linked-agents.json`) and apply across windows and future launches. Changing a switch leaves existing tabs running.
+Choose **Actions > Linked Agents** to turn Codex, GLM-5.3 Flash in Hermes, and DeepSeek V4.1 Flash in Hermes on or off. All three start enabled. Older two-agent settings keep their switches and enable the new DeepSeek agent. Changes are saved immediately in `$XDG_CONFIG_HOME/swarm/linked-agents.json` (normally `~/.config/swarm/linked-agents.json`) and apply across windows and future launches. Changing a switch leaves existing tabs running.
 
-Click **Open Swarm** in the titlebar, or choose **Swarm > Open Swarm**, to open one tab per enabled harness in the active terminal's folder. With both enabled, you get a Codex tab and a Hermes tab; with Hermes off, you get only Codex. Each click opens a fresh set of tabs. If both are off, SWARM opens Linked Agents so you can enable one. If an enabled command is missing, SWARM reports it before opening any tabs.
+Click **Open Swarm** in the titlebar, or choose **Swarm > Open Swarm**, to open one tab per enabled agent in the active terminal's folder. With all three enabled, you get Codex, GLM-5.3 Flash in Hermes, and DeepSeek V4.1 Flash in Hermes. Each has its own switch. Each click opens a fresh set of tabs. If all three are off, SWARM opens Linked Agents so you can enable one. If an enabled command is missing, SWARM reports it before opening any tabs.
 
 The initial terminal lets you `cd` to your project before opening a swarm. Once all swarm agents have started, that terminal closes automatically if its shell has no running jobs. Extra terminals you open yourself stay open, and a failed swarm launch keeps the initial terminal available.
 
-Codex tabs launch with `codex --yolo`. This disables Codex command approvals and its sandbox; the agent runs with your user account's permissions. Manually launched Codex keeps the options you supplied. Hermes launches with `hermes` and uses its own configuration and sign-in. **Actions > Restart Exited Agent** restarts the tab's original harness.
+Codex tabs launch with `codex --yolo`. This disables Codex command approvals and its sandbox; the agent runs with your user account's permissions. Manually launched Codex keeps the options you supplied. The GLM tab launches with `hermes chat --provider zai --model glm-5.3-flash --yolo`. DeepSeek launches with `hermes chat --provider deepseek --model deepseek-flash --reasoning max --yolo`, selecting the latest V4.1 Flash model with maximum reasoning effort. [DeepSeek’s release notes](https://api-docs.deepseek.com/updates/) report stronger coding-agent results than V4 Pro on several benchmarks. Both Hermes tabs bypass command approval prompts with `--yolo` and use Hermes’s saved credentials and tools; these per-session options leave its saved default model in place. **Actions > Restart Exited Agent** restarts the tab's original harness.
 
-Press **Ctrl+T** to open another agent using the selected agent tab's harness and folder: Hermes from a Hermes tab, or Codex from a Codex tab. From a regular terminal or with no agent selected, it opens Codex in the current folder, so you can use `cd` first. **Ctrl+Shift+T** does the same. Linked Agents switches control which harnesses **Open Swarm** opens; the shortcut follows the selected tab even if that harness's switch is off.
+Press **Ctrl+T** to open another agent using the selected agent tab's model and folder: GLM from GLM, DeepSeek from DeepSeek, or Codex from Codex. From a regular terminal or with no agent selected, it opens Codex in the current folder, so you can use `cd` first. **Ctrl+Shift+T** does the same. Linked Agents switches control which harnesses **Open Swarm** opens; the shortcut follows the selected tab even if that harness's switch is off.
 
 **Session > New Terminal** opens another shell in the current folder. Use `cd` to change folders. New windows have their own tabs and broadcasts. Closing SWARM does not save or restore sessions.
 
@@ -70,9 +70,15 @@ All three menus are disabled without running agents. Sleeper Broadcast does not 
 
 ## Account and usage
 
-SWARM reuses Codex's saved sign-in. The Session menu provides ChatGPT and device-code sign-in, plus logout. Logout runs `codex logout` and removes the shared saved login for your operating-system user, including use outside SWARM. Already-running sessions may retain authentication until restarted. Your ChatGPT browser session is separate. These controls and the usage badge apply only to Codex; configure Hermes authentication in Hermes itself.
+SWARM reuses Codex's saved sign-in. The Session menu provides ChatGPT and device-code sign-in, plus logout. Logout runs `codex logout` and removes the shared saved login for your operating-system user, including use outside SWARM. Already-running sessions may retain authentication until restarted. Your ChatGPT browser session is separate. These sign-in controls apply only to Codex; configure Hermes authentication in Hermes itself.
 
-The titlebar shows your remaining usage, including accounts with only a weekly limit. Click or hover to see limits, reset times, and remaining usage resets when the CLI reports them. Usage refreshes every minute while signed in and can be refreshed manually. If limits cannot be read, the badge shows no percentage. Reading usage uses Codex's existing authentication and does not send a prompt.
+The titlebar shows your remaining Codex usage, including accounts with only a weekly limit. Click or hover to see limits, reset times, and remaining usage resets when the CLI reports them. Usage refreshes every minute while signed in and can be refreshed manually. If limits cannot be read, the badge shows no percentage. Reading usage uses Codex's existing authentication and does not send a prompt.
+
+An **orange percentage immediately to its right** shows the Z.ai Coding Plan usage left for **GLM-5.3 Flash in Hermes**. It uses Hermes's saved Z.ai API key and refreshes every minute, independently of Codex sign-in. The percentage follows the shortest model usage window (normally five hours); hover or click to see both that window and the weekly limit, with reset times when reported. Z.ai shares this subscription quota across GLM models. Search and other tool quotas are excluded. Click the badge or its **Refresh** button for an immediate update. Missing credentials or failed requests show **—%** instead of an outdated number. Usage checks only read Z.ai's quota endpoint; they do not send model prompts.
+
+A **blue percentage to the right of GLM** tracks DeepSeek prepaid API credit. DeepSeek's [balance API](https://api-docs.deepseek.com/api/get-user-balance/) reports current money, without a subscription quota or lifetime deposit total. SWARM shows the current balance as a percentage of the **highest balance it has observed**, separately for each API key and currency. It starts at 100% on the first successful check. Spending reduces it; a balance above the previous high updates the baseline. A top-up below that high increases the percentage without resetting it to 100%. Hover or click to see the actual USD/CNY balance and tracked baseline. This is a credit indicator, not a daily/weekly allowance. It refreshes every minute and clears to **—%** if a request fails. Balance checks do not send model prompts.
+
+Configure `DEEPSEEK_API_KEY` in `~/.hermes/.env` (or your `HERMES_HOME/.env`). Local credential files such as `deepseek.txt` are ignored by Git. SWARM never passes the key in process arguments. Balance baselines are stored under `$XDG_STATE_HOME/swarm/deepseek-balance.json` (normally `~/.local/state/swarm/deepseek-balance.json`), identified by a hash of the key. Keep this file to preserve the baseline across launches. Older Hermes versions may display the compatibility alias `deepseek-v4-flash`; DeepSeek currently routes that alias to V4.1 Flash.
 
 ## Optional installation
 
@@ -118,7 +124,7 @@ Building needs no root access. Remove the package with `sudo apt remove swarm-te
 - `app.py`: windows, menus, and broadcast controls.
 - `session.py`: terminal sessions and message delivery.
 - `activity.py` and `codex_detection.py`: activity and foreground process detection.
-- `custom_broadcast.py`: recipient picker; `usage.py`: account usage queries.
+- `custom_broadcast.py`: recipient picker; `usage.py`: Codex usage queries; `zai_usage.py`: Z.ai Coding Plan usage queries; `deepseek_usage.py`: DeepSeek prepaid balance tracking using Hermes credentials.
 - `linked_agents.py` and `linked_agents_dialog.py`: saved harness switches and their configuration window.
 - `notifications.py`: desktop completion alerts.
 - `scripts/` and `packaging/`: installation and Debian packaging.

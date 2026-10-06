@@ -21,6 +21,12 @@ from test_session import FIXTURE, process_alive, pump_until
 class WindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        deepseek_patch = patch("swarm_app.app.fetch_deepseek_usage", return_value=None)
+        deepseek_patch.start()
+        cls.addClassCleanup(deepseek_patch.stop)
+        usage_patch = patch("swarm_app.app.fetch_zai_usage", return_value=None)
+        usage_patch.start()
+        cls.addClassCleanup(usage_patch.stop)
         cls.app = SwarmApplication("/tmp", "/no-such-swarm-codex")
         cls.app.register(None)
         cls.app.hold()

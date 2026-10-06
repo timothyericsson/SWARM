@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from swarm_app.activity import codex_agent_command
 from swarm_app.app import Gtk, SwarmApplication
-from swarm_app.linked_agents import LinkedAgentsSettings
+from swarm_app.linked_agents import LinkedAgentsSettings, agent_command
 from swarm_app.session import TerminalSession
 from gtk_test_support import shutdown_application
 from test_session import FIXTURE, process_alive, pump_until
@@ -21,6 +21,12 @@ from test_session import FIXTURE, process_alive, pump_until
 class OpenSwarmTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        deepseek_patch = patch("swarm_app.app.fetch_deepseek_usage", return_value=None)
+        deepseek_patch.start()
+        cls.addClassCleanup(deepseek_patch.stop)
+        usage_patch = patch("swarm_app.app.fetch_zai_usage", return_value=None)
+        usage_patch.start()
+        cls.addClassCleanup(usage_patch.stop)
         cls.config_temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.config_temp.cleanup)
         cls.settings_path = Path(cls.config_temp.name) / "linked-agents.json"
@@ -47,6 +53,7 @@ class OpenSwarmTests(unittest.TestCase):
         self.app.logout_pending = False
         self.app.set_linked_agent_enabled("codex", True)
         self.app.set_linked_agent_enabled("hermes", True)
+        self.app.set_linked_agent_enabled("deepseek", False)
         self.window = self.app.new_window(start_terminal=False)
         self.windows = [self.window]
 
@@ -92,13 +99,13 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual([session.harness for session in sessions], ["codex", "hermes"])
         self.assertEqual([session.kind for session in sessions], ["agent", "agent"])
         self.assertRegex(sessions[0].title, r"^Codex \d+$")
-        self.assertRegex(sessions[1].title, r"^Hermes \d+$")
+        self.assertRegex(sessions[1].title, r"^GLM-5.3 Flash · Hermes \d+$")
         self.assertTrue(sessions[0].managed_activity_title)
         self.assertFalse(sessions[1].managed_activity_title)
         self.assertEqual(start.call_args_list[0].args,
                          (sessions[0], codex_agent_command("/test/swarm-codex")))
         self.assertEqual(start.call_args_list[1].args,
-                         (sessions[1], ["/test/swarm-hermes"]))
+                         (sessions[1], agent_command("/test/swarm-hermes", "hermes")))
         self.assertEqual(self.window.notebook.get_n_pages(), 2)
 
     def test_disabling_hermes_launches_only_codex(self):
@@ -110,6 +117,72 @@ class OpenSwarmTests(unittest.TestCase):
         resolve.assert_called_once_with(self.app.codex)
         start.assert_called_once_with(codex_agent_command("/test/swarm-codex"))
 
+    def test_three_profiles_launch_exact_models_in_same_folder(self):
+        self.app.set_linked_agent_enabled("deepseek", True)
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable), \
+                patch.object(TerminalSession, "start", autospec=True) as start:
+            sessions = self.window.open_swarm()
+        self.assertEqual([s.agent_profile for s in sessions], ["codex", "hermes", "deepseek"])
+        self.assertEqual([s.harness for s in sessions], ["codex", "hermes", "hermes"])
+        self.assertEqual({s.directory for s in sessions}, {str(self.directory)})
+        self.assertEqual(start.call_args_list[1].args[1],
+                         ["/test/swarm-hermes", "chat", "--provider", "zai", "--model", "glm-5.3-flash", "--yolo"])
+        self.assertEqual(start.call_args_list[2].args[1],
+                         ["/test/swarm-hermes", "chat", "--provider", "deepseek", "--model", "deepseek-flash",
+                          "--reasoning", "max", "--yolo"])
+        self.assertIn("DeepSeek", sessions[2].title)
+
+    def test_deepseek_shortcut_and_restart_keep_profile_when_switch_is_off(self):
+        self.app.set_linked_agent_enabled("deepseek", True)
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable), \
+                patch.object(TerminalSession, "start"):
+            original = self.window.open_swarm()[-1]
+        self.app.set_linked_agent_enabled("deepseek", False)
+        expected = ["/test/swarm-hermes", "chat", "--provider", "deepseek", "--model", "deepseek-flash",
+                    "--reasoning", "max", "--yolo"]
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable), \
+                patch.object(TerminalSession, "start") as start:
+            key, modifiers = Gtk.accelerator_parse("<Primary>t")
+            self.assertTrue(Gtk.accel_groups_activate(self.window, key, modifiers))
+            clone = self.window.current()
+            self.assertEqual(clone.agent_profile, "deepseek")
+            start.assert_called_once_with(expected)
+            clone.state = "exited"
+            start.reset_mock()
+            self.window.restart_current()
+            self.assertEqual(self.window.current().agent_profile, "deepseek")
+            start.assert_called_once_with(expected)
+
+    def test_all_three_really_spawn_broadcast_and_report_hermes_activity(self):
+        self.app.set_linked_agent_enabled("deepseek", True)
+        executable = self.directory / "agent"
+        executable.write_text(
+            "#!/usr/bin/python3\nimport sys\nfrom pathlib import Path\n"
+            "profile = 'codex' if '--provider' not in sys.argv else sys.argv[sys.argv.index('--provider')+1]\n"
+            "folder = Path.cwd()/profile\nfolder.mkdir(exist_ok=True)\n"
+            "import runpy\nsys.argv = [sys.argv[0], str(folder)]\n"
+            f"runpy.run_path({str(FIXTURE)!r}, run_name='__main__')\n")
+        executable.chmod(0o755)
+        with patch.object(self.app, "codex", str(executable)), \
+                patch.object(self.app, "hermes", str(executable)):
+            sessions = self.window.open_swarm()
+        folders = [self.directory / profile for profile in ("codex", "zai", "deepseek")]
+        pump_until(lambda: all(s.state == "running" for s in sessions)
+                   and all((folder / "input").exists() for folder in folders))
+        for session in sessions:
+            self.assertEqual(session.working_directory(), str(self.directory))
+            session.terminal.feed(("\x1b]0;Working\x07" if session.harness == "codex"
+                                   else "\x1b]0;⏳ Hermes\x07").encode())
+        pump_until(lambda: self.window.status_label.get_text() == "3 agents · 3 running")
+        self.assertTrue(self.window.broadcast("Three-agent task"))
+        pump_until(lambda: all((folder / "input").read_bytes().endswith(b"\r") for folder in folders))
+        for folder in folders:
+            self.assertIn(b"Three-agent task", (folder / "input").read_bytes())
+        self.window.open_custom_broadcast()
+        dialog = self.window.custom_broadcast_dialog
+        self.assertEqual(len(dialog.rows), 3)
+        dialog.response(Gtk.ResponseType.CANCEL)
+
     def test_disabling_codex_launches_only_hermes(self):
         self.assertTrue(self.app.set_linked_agent_enabled("codex", False))
         with patch("swarm_app.app.shutil.which", side_effect=self.executable) as resolve, \
@@ -117,7 +190,7 @@ class OpenSwarmTests(unittest.TestCase):
             sessions = self.window.open_swarm()
         self.assertEqual([session.harness for session in sessions], ["hermes"])
         resolve.assert_called_once_with(self.app.hermes)
-        start.assert_called_once_with(["/test/swarm-hermes"])
+        start.assert_called_once_with(agent_command("/test/swarm-hermes", "hermes"))
 
     def test_disabling_both_explains_empty_selection_and_opens_preferences(self):
         self.app.set_linked_agent_enabled("codex", False)
@@ -306,7 +379,7 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertFalse(second.switches["hermes"].get_active())
         self.assertTrue(second.switches["codex"].get_active())
         reloaded = LinkedAgentsSettings(self.settings_path)
-        self.assertEqual(reloaded.enabled, {"codex": True, "hermes": False})
+        self.assertEqual(reloaded.enabled, {"codex": True, "hermes": False, "deepseek": False})
         first.response(Gtk.ResponseType.CLOSE)
         self.window.open_linked_agents()
         self.assertFalse(self.window.linked_agents_dialog.switches["hermes"].get_active())
@@ -332,7 +405,7 @@ class OpenSwarmTests(unittest.TestCase):
             sessions = self.window.open_swarm()
         self.assertEqual([session.harness for session in sessions], ["hermes"])
         resolve.assert_called_once_with(self.app.hermes)
-        start.assert_called_once_with(["/test/swarm-hermes"])
+        start.assert_called_once_with(agent_command("/test/swarm-hermes", "hermes"))
 
     def test_hermes_restart_keeps_original_harness_even_when_disabled(self):
         self.app.set_linked_agent_enabled("codex", False)
@@ -352,7 +425,7 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual(replacement.directory, str(self.directory))
         self.assertFalse(replacement.managed_activity_title)
         resolve.assert_called_once_with(self.app.hermes)
-        start.assert_called_once_with(["/test/swarm-hermes"])
+        start.assert_called_once_with(agent_command("/test/swarm-hermes", "hermes"))
 
     def test_new_agent_remains_codex_when_linked_codex_is_disabled(self):
         self.app.set_linked_agent_enabled("codex", False)
@@ -390,7 +463,7 @@ class OpenSwarmTests(unittest.TestCase):
                     self.assertEqual(session.managed_activity_title, original.harness == "codex")
                     executable = getattr(self.app, original.harness)
                     resolve.assert_called_once_with(executable)
-                    command = codex_agent_command(executable) if original.harness == "codex" else [executable]
+                    command = codex_agent_command(executable) if original.harness == "codex" else agent_command(executable, original.agent_profile)
                     start.assert_called_once_with(session, command)
 
     def test_new_agent_shortcut_matches_exited_agent_even_when_unlinked(self):
@@ -415,7 +488,7 @@ class OpenSwarmTests(unittest.TestCase):
                 self.assertEqual(session.directory, original.directory)
                 executable = getattr(self.app, original.harness)
                 resolve.assert_called_once_with(executable)
-                command = codex_agent_command(executable) if original.harness == "codex" else [executable]
+                command = codex_agent_command(executable) if original.harness == "codex" else agent_command(executable, original.agent_profile)
                 start.assert_called_once_with(command)
 
     def test_codex_logout_blocks_codex_shortcut_but_allows_hermes_shortcut(self):
@@ -437,7 +510,7 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual(self.window.sessions, [codex, hermes, session])
         self.assertEqual(session.harness, "hermes")
         resolve.assert_called_once_with(self.app.hermes)
-        start.assert_called_once_with(["/test/swarm-hermes"])
+        start.assert_called_once_with(agent_command("/test/swarm-hermes", "hermes"))
 
     def test_ctrl_t_from_terminal_defaults_to_codex(self):
         with patch.object(TerminalSession, "start"):
