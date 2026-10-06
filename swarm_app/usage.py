@@ -17,30 +17,12 @@ import threading
 import time
 
 from . import __version__
+from .usage_types import UsageSnapshot, UsageUnavailable, UsageWindow
 
 
 MAX_LINE_BYTES = 256 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
 POLL_SECONDS = 0.1
-
-
-class UsageUnavailable(Exception):
-    """A sanitized reason why current usage could not be read."""
-
-
-@dataclass(frozen=True)
-class UsageWindow:
-    remaining: float
-    duration_minutes: int | None
-    resets_at: int | None
-
-
-@dataclass(frozen=True)
-class UsageSnapshot:
-    # The shortest known window comes first. A single weekly window is primary.
-    primary: UsageWindow | None
-    secondary: UsageWindow | None
-    reset_credits_remaining: int | None = None
 
 
 def _optional_integer(value, minimum: int, maximum: int) -> int | None:

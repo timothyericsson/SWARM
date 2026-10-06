@@ -32,6 +32,7 @@ from .activity import (
     title_activity,
     title_finished,
 )
+from .usage_types import UsageSnapshot
 
 
 class Harness:
@@ -51,6 +52,10 @@ class Harness:
     finish_notifications = False
     # Custom Broadcast status label when the agent is not working.
     not_ready_status = "Not ready"
+    # Usage badge (titlebar): label, fetcher, and accent color. None = no badge.
+    usage_label = None
+    usage_accent = "#9ed8bd"
+    usage_classes = ()
 
     def executable_environment(self) -> str:
         """Environment variable overriding this harness's executable."""
@@ -95,6 +100,12 @@ class CodexHarness(Harness):
     default_executable = "codex"
     managed_activity_title = True
     finish_notifications = True
+    usage_label = "Codex usage"
+    usage_classes = ("usage-codex",)
+
+    def fetch_usage(self, executable: str, cancel) -> "UsageSnapshot":
+        from .usage import fetch_usage
+        return fetch_usage(executable, cancel=cancel)
 
     def resolve(self, window) -> str | None:
         # Reuse the window's Codex resolver: it is also the seam for the
@@ -126,6 +137,13 @@ class HermesHarness(Harness):
     name = "Hermes"
     default_executable = "hermes"
     not_ready_status = "Not working"
+    usage_label = "Hermes usage"
+    usage_accent = "#e8a35c"
+    usage_classes = ("usage-hermes",)
+
+    def fetch_usage(self, executable: str, cancel) -> "UsageSnapshot":
+        from .hermes_usage import fetch_hermes_usage
+        return fetch_hermes_usage(executable, cancel=cancel)
 
     def agent_command(self, executable: str) -> list[str]:
         return hermes_agent_command(executable)

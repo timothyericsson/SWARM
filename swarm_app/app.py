@@ -26,7 +26,7 @@ from .linked_agents import HARNESS_NAMES, LinkedAgentsSettings
 from .linked_agents_dialog import LinkedAgentsDialog
 from .notifications import notify_agents_finished
 from .session import TerminalSession, normalize_message
-from .usage import UsageUnavailable, fetch_usage
+from .usage_types import UsageUnavailable
 
 
 CSS = b"""
@@ -49,6 +49,8 @@ notebook > header > tabs > tab:checked { border-top: 2px solid #88c5ad; }
 .swarm-header { min-height: 28px; padding: 3px 8px; background-color: #252830; }
 .usage-badge { padding: 2px 5px; min-height: 20px; min-width: 36px; font-weight: bold; }
 .usage-badge label { color: #9ed8bd; }
+.usage-badge.usage-hermes label { color: #e8a35c; }
+.usage-badge.usage-hermes.usage-unknown label { color: #b5814b; }
 .usage-badge.usage-unknown label { color: #a6adba; }
 .usage-badge.usage-low label { color: #ff6b6b; }
 """
@@ -247,6 +249,154 @@ class BroadcastDialog(Gtk.Dialog):
             self.owner.broadcast_dialog = None
 
 
+class _UsageBadge:
+    """One harness's titlebar usage button and its details popover."""
+
+    def __init__(self, window, spec):
+        self.window = window
+        self.spec = spec
+        self.hover_source = self.hide_source = 0
+        self.hovered = self.panel_hovered = self.pinned = False
+        self.button = Gtk.Button(label="—%")
+        self.button.set_relief(Gtk.ReliefStyle.NONE)
+        self.button.set_focus_on_click(False)
+        self.button.get_style_context().add_class("usage-badge")
+        for style in spec.usage_classes:
+            self.button.get_style_context().add_class(style)
+        self.button.get_accessible().set_name(f"{spec.name} usage remaining")
+        self.button.connect("clicked", self._clicked)
+        self.button.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.button.connect("enter-notify-event", self._enter)
+        self.button.connect("leave-notify-event", self._leave)
+        self.panel = Gtk.Popover.new(self.button)
+        self.panel.set_position(Gtk.PositionType.BOTTOM)
+        self.panel.set_modal(False)
+        self.panel.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.panel.connect("enter-notify-event", self._enter)
+        self.panel.connect("leave-notify-event", self._leave)
+        self.panel.connect("closed", lambda *_: self._pin(False))
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_border_width(16)
+        heading = label("")
+        heading.set_markup(f"<b>{spec.usage_label}</b>")
+        self.details = label("")
+        self.details.set_line_wrap(True)
+        self.details.set_max_width_chars(48)
+        self.details.set_width_chars(36)
+        self.details.set_can_focus(False)
+        self.updated = label("", "muted")
+        self.updated.set_line_wrap(True)
+        self.refresh_button = Gtk.Button(label="Refresh")
+        self.refresh_button.connect("clicked", lambda *_: window.app.refresh_usage(spec.key))
+        footer = Gtk.Box(spacing=12)
+        footer.pack_start(label("Updates every minute", "muted"), True, True, 0)
+        footer.pack_end(self.refresh_button, False, False, 0)
+        for widget in (heading, self.details, self.updated, footer):
+            content.pack_start(widget, False, False, 0)
+        self.panel.add(content)
+        content.show_all()
+
+    def _cancel_timers(self):
+        for source in (self.hover_source, self.hide_source):
+            if source:
+                GLib.source_remove(source)
+        self.hover_source = self.hide_source = 0
+
+    def _enter(self, widget, event):
+        if self.window.closing or event.mode != Gdk.CrossingMode.NORMAL or event.detail == Gdk.NotifyType.INFERIOR:
+            return False
+        setattr(self, "hovered" if widget is self.button else "panel_hovered", True)
+        self._cancel_timers()
+        if self.hovered and not self.panel.get_visible():
+            self.hover_source = GLib.timeout_add(350, self._show)
+        return False
+
+    def _leave(self, widget, event):
+        if self.window.closing or event.mode != Gdk.CrossingMode.NORMAL or event.detail == Gdk.NotifyType.INFERIOR:
+            return False
+        setattr(self, "hovered" if widget is self.button else "panel_hovered", False)
+        self._cancel_timers()
+        if not self.pinned:
+            self.hide_source = GLib.timeout_add(200, self._hide)
+        return False
+
+    def _show(self):
+        self.hover_source = 0
+        if not self.window.closing and self.hovered and not self.pinned:
+            self.update(self.window.app)
+            self.panel.set_modal(False)  # Hover must not grab the keyboard.
+            self.panel.popup()
+        return GLib.SOURCE_REMOVE
+
+    def _hide(self):
+        self.hide_source = 0
+        if not self.window.closing and not self.pinned and not self.hovered and not self.panel_hovered:
+            self.panel.popdown()
+        return GLib.SOURCE_REMOVE
+
+    def _clicked(self, *_):
+        self._cancel_timers()
+        if self.pinned and self.panel.get_visible():
+            self.panel.popdown()
+            return
+        self._pin(True)
+        self.update(self.window.app)
+        self.panel.set_modal(True)
+        self.panel.popup()
+        self.window.app.refresh_usage()  # Refresh in the background.
+
+    def _pin(self, pinned):
+        self._cancel_timers()
+        self.pinned = pinned
+        if not pinned:
+            self.panel_hovered = False
+
+    def destroy(self):
+        self._cancel_timers()
+        self.panel.destroy()
+
+    def update(self, app):
+        state = app.usage.get(self.spec.key)
+        if state is None:
+            return
+        snapshot = state["snapshot"]
+        main = snapshot.primary if snapshot is not None else None
+        style = self.button.get_style_context()
+        style.remove_class("usage-low")
+        style.remove_class("usage-unknown")
+        if main is None:
+            self.button.set_label("—%")
+            style.add_class("usage-unknown")
+        else:
+            self.button.set_label(f"{math.floor(main.remaining)}%")
+            if main.remaining <= 10:
+                style.add_class("usage-low")
+        rows = []
+        if snapshot is not None:
+            for window in (snapshot.primary, snapshot.secondary):
+                if window is None:
+                    continue
+                name = window.label or usage_window_name(window.duration_minutes)
+                row = f"{name}: {math.floor(window.remaining)}% left"
+                reset = local_usage_time(window.resets_at)
+                row += (f"\nResets {reset} (local time)\n{usage_reset_countdown(window.resets_at)}"
+                        if reset else "\nReset time not reported")
+                rows.append(row)
+            if snapshot.reset_credits_remaining is not None:
+                rows.append(f"Usage resets remaining: {snapshot.reset_credits_remaining}")
+        if not rows:
+            rows.append(state["status"])
+        detail = "\n\n".join(rows)
+        self.details.set_text(detail)
+        updated = local_usage_time(state["updated_at"])
+        self.updated.set_text("Refreshing…" if state["pending"] else
+                              f"Updated {updated}" if updated else "")
+        self.refresh_button.set_sensitive(not state["pending"] and self.button.get_visible())
+        accessible = self.button.get_accessible()
+        accessible.set_name(f"{self.spec.name} usage remaining: {self.button.get_label()}")
+        accessible.set_description(detail + "\nClick for usage details")
+
+
 class SwarmWindow(Gtk.ApplicationWindow):
     def __init__(self, app, directory):
         super().__init__(application=app, title="SWARM")
@@ -272,11 +422,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.broadcast_watches = []
         self.flash_source = 0
         self.last_states = {}
-        self.usage_hover_source = 0
-        self.usage_hide_source = 0
-        self.usage_hovered = False
-        self.usage_panel_hovered = False
-        self.usage_pinned = False
+        self.usage_badges = {}
         self.set_default_size(1040, 690)
         self.set_size_request(560, 340)
         self.set_icon_name("swarm-terminal")
@@ -340,162 +486,34 @@ class SwarmWindow(Gtk.ApplicationWindow):
         else:
             icon = Gtk.Image.new_from_icon_name("swarm-terminal", Gtk.IconSize.MENU)
         icon.set_tooltip_text("SWARM")
-        badge = Gtk.Box(spacing=4)
-        badge.pack_start(icon, False, False, 0)
-        self.usage_button = Gtk.Button(label="—%")
-        self.usage_button.set_relief(Gtk.ReliefStyle.NONE)
-        self.usage_button.set_focus_on_click(False)
-        self.usage_button.get_style_context().add_class("usage-badge")
-        self.usage_button.get_accessible().set_name("Codex usage remaining")
-        self.usage_button.connect("clicked", self._usage_clicked)
-        self.usage_button.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
-        self.usage_button.connect("enter-notify-event", self._usage_enter)
-        self.usage_button.connect("leave-notify-event", self._usage_leave)
-        badge.pack_start(self.usage_button, False, False, 0)
-        header.pack_start(badge)
+        self.usage_box = Gtk.Box(spacing=4)
+        self.usage_box.pack_start(icon, False, False, 0)
+        header.pack_start(self.usage_box)
         self.open_swarm_button = Gtk.Button(label="Open Swarm")
         self.open_swarm_button.set_tooltip_text("Open one agent tab for each enabled harness in the current folder")
         self.open_swarm_button.connect("clicked", lambda *_: self.open_swarm())
         header.pack_end(self.open_swarm_button)
-        self._create_usage_panel()
         header.show_all()
+        self.update_usage()
         return header
 
-    def _create_usage_panel(self):
-        self.usage_panel = Gtk.Popover.new(self.usage_button)
-        self.usage_panel.set_position(Gtk.PositionType.BOTTOM)
-        self.usage_panel.set_modal(False)
-        self.usage_panel.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
-        self.usage_panel.connect("enter-notify-event", self._usage_enter)
-        self.usage_panel.connect("leave-notify-event", self._usage_leave)
-        self.usage_panel.connect("closed", self._usage_closed)
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        content.set_border_width(16)
-        heading = label("")
-        heading.set_markup("<b>Codex usage</b>")
-        content.pack_start(heading, False, False, 0)
-        self.usage_details = label("")
-        self.usage_details.set_line_wrap(True)
-        self.usage_details.set_max_width_chars(48)
-        self.usage_details.set_width_chars(36)
-        self.usage_details.set_selectable(False)
-        self.usage_details.set_can_focus(False)
-        content.pack_start(self.usage_details, False, False, 0)
-        self.usage_updated = label("", "muted")
-        self.usage_updated.set_line_wrap(True)
-        content.pack_start(self.usage_updated, False, False, 0)
-        footer = Gtk.Box(spacing=12)
-        cadence = label("Updates every minute", "muted")
-        footer.pack_start(cadence, True, True, 0)
-        self.usage_refresh_button = Gtk.Button(label="Refresh")
-        self.usage_refresh_button.connect("clicked", lambda *_: self.app.refresh_usage())
-        footer.pack_end(self.usage_refresh_button, False, False, 0)
-        content.pack_start(footer, False, False, 0)
-        self.usage_panel.add(content)
-        content.show_all()
-
-    def _cancel_usage_timers(self):
-        for name in ("usage_hover_source", "usage_hide_source"):
-            source = getattr(self, name)
-            if source:
-                GLib.source_remove(source)
-                setattr(self, name, 0)
-
-    def _usage_enter(self, widget, event):
-        if self.closing or event.mode != Gdk.CrossingMode.NORMAL or event.detail == Gdk.NotifyType.INFERIOR:
-            return False
-        if widget is self.usage_button:
-            self.usage_hovered = True
-        else:
-            self.usage_panel_hovered = True
-        self._cancel_usage_timers()
-        if self.usage_hovered and not self.usage_panel.get_visible():
-            self.usage_hover_source = GLib.timeout_add(350, self._show_usage_hover)
-        return False
-
-    def _usage_leave(self, widget, event):
-        if self.closing or event.mode != Gdk.CrossingMode.NORMAL or event.detail == Gdk.NotifyType.INFERIOR:
-            return False
-        if widget is self.usage_button:
-            self.usage_hovered = False
-        else:
-            self.usage_panel_hovered = False
-        self._cancel_usage_timers()
-        if not self.usage_pinned:
-            self.usage_hide_source = GLib.timeout_add(200, self._hide_usage_hover)
-        return False
-
-    def _show_usage_hover(self):
-        self.usage_hover_source = 0
-        if not self.closing and self.usage_hovered and not self.usage_pinned:
-            self.update_usage()
-            # Hover must not grab the keyboard from the terminal.
-            self.usage_panel.set_modal(False)
-            self.usage_panel.popup()
-        return GLib.SOURCE_REMOVE
-
-    def _hide_usage_hover(self):
-        self.usage_hide_source = 0
-        if not self.closing and not self.usage_pinned and not self.usage_hovered and not self.usage_panel_hovered:
-            self.usage_panel.popdown()
-        return GLib.SOURCE_REMOVE
-
-    def _usage_clicked(self, *_):
-        self._cancel_usage_timers()
-        if self.usage_pinned and self.usage_panel.get_visible():
-            self.usage_panel.popdown()
-            return
-        self.usage_pinned = True
-        self.update_usage()
-        self.usage_panel.set_modal(True)
-        self.usage_panel.popup()
-        # Refresh in the background while keeping existing details visible.
-        self.app.refresh_usage()
-
-    def _usage_closed(self, *_):
-        self._cancel_usage_timers()
-        self.usage_pinned = False
-        self.usage_panel_hovered = False
-
     def update_usage(self):
-        snapshot = self.app.usage_snapshot
-        main = snapshot.primary if snapshot is not None else None
-        style = self.usage_button.get_style_context()
-        style.remove_class("usage-low")
-        style.remove_class("usage-unknown")
-        if main is None:
-            self.usage_button.set_label("—%")
-            style.add_class("usage-unknown")
-        else:
-            self.usage_button.set_label(f"{math.floor(main.remaining)}%")
-            if main.remaining <= 10:
-                style.add_class("usage-low")
-        rows = []
-        if snapshot is not None:
-            for window in (snapshot.primary, snapshot.secondary):
-                if window is None:
-                    continue
-                row = f"{usage_window_name(window.duration_minutes)}: {math.floor(window.remaining)}% left"
-                reset = local_usage_time(window.resets_at)
-                if reset:
-                    row += f"\nResets {reset} (local time)\n{usage_reset_countdown(window.resets_at)}"
+        """Sync the titlebar badges with the Linked Agents selection."""
+        enabled = self.app.linked_agents.enabled
+        for spec in HARNESS_ORDER:
+            wanted = bool(spec.usage_label) and enabled.get(spec.key)
+            badge = self.usage_badges.get(spec.key)
+            if wanted and badge is None:
+                badge = self.usage_badges[spec.key] = _UsageBadge(self, spec)
+                self.usage_box.pack_start(badge.button, False, False, 0)
+                badge.button.show_all()
+            if badge is not None:
+                if wanted:
+                    badge.update(self.app)
                 else:
-                    row += "\nReset time not reported"
-                rows.append(row)
-        if not rows:
-            rows.append(self.app.usage_status)
-        resets = snapshot.reset_credits_remaining if snapshot is not None else None
-        rows.append(f"Usage resets remaining: {resets if resets is not None else 'Not reported'}")
-        detail = "\n\n".join(rows)
-        self.usage_details.set_text(detail)
-        updated = local_usage_time(self.app.usage_updated_at)
-        self.usage_updated.set_text("Refreshing…" if self.app.usage_pending else
-                                    f"Updated {updated}" if updated else "")
-        self.usage_refresh_button.set_sensitive(not self.app.usage_pending and not self.app.auth_busy()
-                                               and self.app.auth_state in ("chatgpt", "other"))
-        accessible = self.usage_button.get_accessible()
-        accessible.set_name(f"Codex usage remaining: {self.usage_button.get_label()}")
-        accessible.set_description(detail + "\nClick for usage details")
+                    badge.destroy()
+                    del self.usage_badges[spec.key]
+                    self.usage_box.remove(badge.button)
 
     def _menu_bar(self):
         bar = Gtk.MenuBar()
@@ -1332,8 +1350,9 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.startup_terminal = None
         self._startup_swarm = []
         self.broadcast_watches.clear()
-        self._cancel_usage_timers()
-        self.usage_panel.destroy()
+        for badge in self.usage_badges.values():
+            badge.destroy()
+        self.usage_badges.clear()
         if self.linked_agents_dialog is not None:
             self.linked_agents_dialog.destroy()
         had_login = any(session.kind == "login" for session in self.sessions)
@@ -1374,12 +1393,7 @@ class SwarmApplication(Gtk.Application):
         self.auth_pending = False
         self.auth_refresh_requested = False
         self.logout_pending = False
-        self.usage_snapshot = None
-        self.usage_status = "Checking Codex login…"
-        self.usage_updated_at = None
-        self.usage_pending = False
-        self.usage_generation = 0
-        self.usage_cancel = None
+        self.usage = {}  # Per-harness: snapshot, status, updated_at, pending, generation, cancel
         self.usage_poll = 0
 
     def set_linked_agent_enabled(self, harness, enabled):
@@ -1391,8 +1405,12 @@ class SwarmApplication(Gtk.Application):
         else:
             saved = True
         for window in self.get_windows():
-            if isinstance(window, SwarmWindow) and not window.closing and window.linked_agents_dialog is not None:
-                window.linked_agents_dialog.refresh()
+            if isinstance(window, SwarmWindow) and not window.closing:
+                window.update_usage()
+                if window.linked_agents_dialog is not None:
+                    window.linked_agents_dialog.refresh()
+        if enabled:
+            self.refresh_usage(harness)
         return saved
 
     def do_startup(self):
@@ -1414,6 +1432,9 @@ class SwarmApplication(Gtk.Application):
     def do_activate(self):
         self.new_window(self.directory)
         self.refresh_auth()
+        for spec in HARNESS_ORDER:
+            if spec.usage_label and spec.key != "codex":
+                self.refresh_usage(spec.key)
 
     def shell_command(self):
         candidates = [os.environ.get("SHELL")]
@@ -1442,7 +1463,7 @@ class SwarmApplication(Gtk.Application):
             self.auth_refresh_requested = True
             return
         self.auth_pending = True
-        self.invalidate_usage("Checking Codex login…")
+        self.invalidate_usage("Checking Codex login…", "codex")
         self._set_auth_status("Checking login…")
 
         def check():
@@ -1487,7 +1508,7 @@ class SwarmApplication(Gtk.Application):
         if self.auth_busy() or self.auth_state not in ("chatgpt", "other"):
             return False
         self.logout_pending = True
-        self.invalidate_usage("Signing out…")
+        self.invalidate_usage("Signing out…", "codex")
         self.hold()
         self._set_auth_status("Signing out…")
 
@@ -1523,7 +1544,7 @@ class SwarmApplication(Gtk.Application):
             self.auth_state = state
             if state not in ("chatgpt", "other"):
                 self.invalidate_usage("Sign in with ChatGPT to see usage" if state == "signed_out" else
-                                      "Codex usage unavailable")
+                                      "Codex usage unavailable", "codex")
         for window in self.get_windows():
             if isinstance(window, SwarmWindow) and not window.closing:
                 window.account_label.set_text(status)
@@ -1540,62 +1561,74 @@ class SwarmApplication(Gtk.Application):
         return GLib.SOURCE_REMOVE
 
     def _poll_usage(self):
-        self.refresh_usage()
+        for spec in HARNESS_ORDER:
+            if spec.usage_label:
+                self.refresh_usage(spec.key)
         return GLib.SOURCE_CONTINUE
 
-    def sync_usage(self):
+    def sync_usage(self, harness=None):
         for window in self.get_windows():
             if isinstance(window, SwarmWindow) and not window.closing:
                 window.update_usage()
 
-    def invalidate_usage(self, status):
-        self.usage_generation += 1
-        if self.usage_cancel is not None:
-            self.usage_cancel.set()
-            self.usage_cancel = None
-        self.usage_pending = False
-        self.usage_snapshot = None
-        self.usage_updated_at = None
-        self.usage_status = status
+    def _usage_state(self, harness):
+        return self.usage.setdefault(harness, {"snapshot": None, "status": "Checking…",
+                                               "updated_at": None, "pending": False,
+                                               "generation": 0, "cancel": None})
+
+    def invalidate_usage(self, status, harness=None):
+        """Reset one harness's tracker (or all of them when harness is None)."""
+        for spec in HARNESS_ORDER:
+            if harness in (None, spec.key) and spec.usage_label:
+                state = self._usage_state(spec.key)
+                state["generation"] += 1
+                if state["cancel"] is not None:
+                    state["cancel"].set()
+                state.update(snapshot=None, updated_at=None, pending=False, status=status)
         self.sync_usage()
 
-    def refresh_usage(self):
-        if self.usage_pending or self.auth_busy() or self.auth_state not in ("chatgpt", "other"):
+    def refresh_usage(self, harness=None):
+        """Fetch one harness's usage in a worker thread; False when skipped."""
+        spec = HARNESSES.get(harness or "codex")
+        if spec is None or not spec.usage_label:
             return False
-        if not any(isinstance(window, SwarmWindow) and not window.closing for window in self.get_windows()):
+        state = self._usage_state(spec.key)
+        if state["pending"] or not any(isinstance(w, SwarmWindow) and not w.closing
+                                       for w in self.get_windows()):
             return False
-        self.usage_pending = True
-        self.usage_status = "Checking Codex usage…"
-        self.usage_generation += 1
-        generation = self.usage_generation
+        if spec.key == "codex" and (self.auth_busy() or self.auth_state not in ("chatgpt", "other")):
+            return False
+        executable = getattr(self, spec.key)
+        state.update(pending=True, status=f"Checking {spec.name} usage…")
+        state["generation"] += 1
+        generation = state["generation"]
         cancel = threading.Event()
-        self.usage_cancel = cancel
+        state["cancel"] = cancel
         self.sync_usage()
 
         def check():
-            snapshot = None
-            error = None
+            snapshot = error = None
             try:
-                snapshot = fetch_usage(self.codex, cancel=cancel)
+                snapshot = spec.fetch_usage(executable, cancel)
             except UsageUnavailable as exc:
                 error = str(exc)
             except Exception:
-                error = "Codex usage unavailable. Click to try again."
-            GLib.idle_add(self._usage_finished, generation, snapshot, error)
+                error = f"{spec.name} usage unavailable. Click to try again."
+            GLib.idle_add(self._usage_finished, spec.key, generation, snapshot, error)
 
         # Allow the cancelled worker to close and reap its helper at shutdown.
         threading.Thread(target=check, daemon=False).start()
         return True
 
-    def _usage_finished(self, generation, snapshot, error):
-        # Results from a request started before logout must not restore the
-        # previous account's numbers after the account changes.
-        if generation != self.usage_generation:
+    def _usage_finished(self, harness, generation, snapshot, error):
+        state = self._usage_state(harness)
+        # Results from a request started before an invalidation must not
+        # restore stale numbers after the account or configuration changes.
+        if generation != state["generation"]:
             return GLib.SOURCE_REMOVE
-        self.usage_pending = False
-        self.usage_cancel = None
-        self.usage_snapshot = snapshot if error is None else None
-        self.usage_updated_at = time.time() if self.usage_snapshot is not None else None
-        self.usage_status = error or "Codex did not report a usage limit"
+        state.update(pending=False, cancel=None,
+                     snapshot=snapshot if error is None else None,
+                     updated_at=time.time() if error is None and snapshot is not None else None,
+                     status=error or f"{HARNESSES[harness].name} did not report a usage limit")
         self.sync_usage()
         return GLib.SOURCE_REMOVE
