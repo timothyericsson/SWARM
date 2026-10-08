@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from swarm_app.activity import codex_agent_command
 from swarm_app.app import Gtk, SwarmApplication
-from swarm_app.linked_agents import LinkedAgentsSettings, agent_command
+from swarm_app.linked_agents import (LinkedAgentsSettings, StartupAgent, agent_command,
+                                    default_startup_agents)
 from swarm_app.session import TerminalSession
 from gtk_test_support import shutdown_application
 from test_session import FIXTURE, process_alive, pump_until
@@ -31,7 +32,8 @@ class OpenSwarmTests(unittest.TestCase):
         cls.addClassCleanup(cls.config_temp.cleanup)
         cls.settings_path = Path(cls.config_temp.name) / "linked-agents.json"
         cls.app = SwarmApplication("/tmp", "/test/swarm-codex", "/test/swarm-hermes",
-                                   linked_agents_path=cls.settings_path)
+                                   linked_agents_path=cls.settings_path,
+                                   deepseek_key_path=Path(cls.config_temp.name) / "deepseek.txt")
         cls.app.set_application_id("io.swarm.Terminal.OpenSwarmTests")
         if not cls.app.register(None):
             raise AssertionError("The test application could not register")
@@ -51,8 +53,8 @@ class OpenSwarmTests(unittest.TestCase):
         self.app.auth_pending = False
         self.app.auth_refresh_requested = False
         self.app.logout_pending = False
-        self.app.set_linked_agent_enabled("codex", True)
-        self.app.set_linked_agent_enabled("hermes", True)
+        self.app.linked_agents.save(default_startup_agents(), False)
+        self.app._startup_settings_shown = False
         self.app.set_linked_agent_enabled("deepseek", False)
         self.window = self.app.new_window(start_terminal=False)
         self.windows = [self.window]
@@ -372,27 +374,109 @@ class OpenSwarmTests(unittest.TestCase):
         other.open_linked_agents()
         first = self.window.linked_agents_dialog
         second = other.linked_agents_dialog
-        self.assertTrue(first.switches["codex"].get_active())
-        self.assertTrue(first.switches["hermes"].get_active())
-        first.switches["hermes"].set_active(False)
+        self.assertTrue(first.rows[0].enabled.get_active())
+        self.assertTrue(first.rows[1].enabled.get_active())
+        first.rows[1].enabled.set_active(False)
+        self.assertTrue(self.app.linked_agents.enabled["hermes"])
+        first.response(Gtk.ResponseType.OK)
         self.assertFalse(self.app.linked_agents.enabled["hermes"])
-        self.assertFalse(second.switches["hermes"].get_active())
-        self.assertTrue(second.switches["codex"].get_active())
+        self.assertFalse(second.rows[1].enabled.get_active())
+        self.assertTrue(second.rows[0].enabled.get_active())
         reloaded = LinkedAgentsSettings(self.settings_path)
         self.assertEqual(reloaded.enabled, {"codex": True, "hermes": False, "deepseek": False})
-        first.response(Gtk.ResponseType.CLOSE)
         self.window.open_linked_agents()
-        self.assertFalse(self.window.linked_agents_dialog.switches["hermes"].get_active())
+        self.assertFalse(self.window.linked_agents_dialog.rows[1].enabled.get_active())
 
-    def test_unsaved_switch_change_reverts_and_reports_failure(self):
+    def test_unsaved_switch_change_keeps_draft_and_reports_failure(self):
         self.window.open_linked_agents()
         dialog = self.window.linked_agents_dialog
-        with patch.object(self.app.linked_agents, "set_enabled", side_effect=OSError("Disk full")):
-            dialog.switches["hermes"].set_active(False)
-        self.assertTrue(dialog.switches["hermes"].get_active())
+        dialog.rows[1].enabled.set_active(False)
+        with patch.object(self.app.linked_agents, "save", side_effect=OSError("Disk full")):
+            dialog.response(Gtk.ResponseType.OK)
+        self.assertFalse(dialog.rows[1].enabled.get_active())
         self.assertTrue(self.app.linked_agents.enabled["hermes"])
         self.assertIn("Disk full", dialog.feedback.get_text())
         self.assertTrue(LinkedAgentsSettings(self.settings_path).enabled["hermes"])
+
+    def test_activation_shows_setup_once_and_honors_saved_checkbox(self):
+        with patch.object(self.app, "new_window", return_value=self.window), \
+                patch.object(self.app, "refresh_auth"), \
+                patch.object(self.app, "refresh_zai_usage"), \
+                patch.object(self.app, "refresh_deepseek_usage"):
+            self.app.do_activate()
+            dialog = self.window.linked_agents_dialog
+            self.assertIsNotNone(dialog)
+            self.assertEqual(len(dialog.rows), 3)
+            dialog.dont_show_again.set_active(True)
+            dialog.response(Gtk.ResponseType.OK)
+            self.assertTrue(LinkedAgentsSettings(self.settings_path).dont_show_again)
+            self.app.do_activate()
+            self.assertIsNone(self.window.linked_agents_dialog)
+            self.app._startup_settings_shown = False
+            self.app.do_activate()
+            self.assertIsNone(self.window.linked_agents_dialog)
+        self.window.linked_agents_item.activate()
+        self.assertTrue(self.window.linked_agents_dialog.dont_show_again.get_active())
+
+    def test_extra_custom_agent_spawns_quoted_command_in_current_folder(self):
+        executable = self.directory / "custom helper"
+        marker = self.directory / "custom.launch"
+        executable.write_text(
+            "#!/usr/bin/python3\nimport json, sys\nfrom pathlib import Path\n"
+            "Path('custom.launch').write_text(json.dumps([str(Path.cwd()), sys.argv[1:]]))\n")
+        executable.chmod(0o755)
+        entries = [*self.app.linked_agents.agents,
+                   StartupAgent("extra", "Custom model", "'./custom helper' --model 'name with spaces'")]
+        self.app.save_startup_swarm(entries, True)
+        # Launch the real custom process; known harnesses use local fixtures.
+        executables = self.harness_executables()
+        with patch.object(self.app, "codex", str(executables["codex"])), \
+                patch.object(self.app, "hermes", str(executables["hermes"])):
+            sessions = self.window.open_swarm()
+        pump_until(marker.exists)
+        self.assertEqual(len(sessions), 3)
+        self.assertEqual(sessions[-1].harness, "custom")
+        self.assertEqual(json.loads(marker.read_text()), [str(self.directory), ["--model", "name with spaces"]])
+        self.assertIsNone(sessions[-1].activity)
+        self.assertFalse(sessions[-1].agent_idle)
+
+    def test_custom_command_snapshot_survives_settings_edits_for_clone_and_restart(self):
+        agent = StartupAgent("extra", "Assistant", "/bin/cat --number")
+        self.app.save_startup_swarm([agent], False)
+        with patch.object(TerminalSession, "start") as start:
+            original = self.window.open_swarm()[0]
+            start.assert_called_once_with(["/bin/cat", "--number"])
+        self.app.save_startup_swarm([], False)
+        with patch.object(TerminalSession, "start") as start:
+            clone = self.window.new_agent()
+            start.assert_called_once_with(["/bin/cat", "--number"])
+        self.assertEqual(clone.startup_agent, agent)
+        self.window.notebook.set_current_page(self.window.notebook.page_num(original))
+        original.state = "exited"
+        with patch.object(TerminalSession, "start") as start:
+            self.window.restart_current()
+            start.assert_called_once_with(["/bin/cat", "--number"])
+        self.assertEqual(self.window.current().startup_agent, agent)
+        self.assertEqual(self.window.current().title, original.title)
+
+    def test_missing_custom_command_prevents_partial_launch(self):
+        self.app.save_startup_swarm([StartupAgent("one", "First", "/bin/cat"),
+                                     StartupAgent("two", "Missing", "/no-such-agent")], False)
+        with patch.object(TerminalSession, "start") as start, patch.object(self.window, "message") as message:
+            self.assertEqual(self.window.open_swarm(), [])
+        start.assert_not_called()
+        message.assert_called_once()
+        self.assertEqual(self.window.sessions, [])
+
+    def test_edited_codex_flags_and_literal_prompt_keep_their_order(self):
+        self.app.save_startup_swarm([StartupAgent("one", "Coder", "codex --yolo -m my-model -- 'some prompt'")], False)
+        with patch("swarm_app.app.shutil.which", side_effect=self.executable), \
+                patch.object(TerminalSession, "start") as start:
+            session = self.window.open_swarm()[0]
+        self.assertEqual(start.call_args.args[0], [self.app.codex, "--yolo", "-m", "my-model", "-c",
+                                                 'tui.terminal_title=["spinner","status"]', "--", "some prompt"])
+        self.assertEqual(session.harness, "codex")
+        self.assertTrue(session.managed_activity_title)
 
     def test_codex_logout_blocks_codex_swarm_but_allows_hermes_only(self):
         self.app.logout_pending = True

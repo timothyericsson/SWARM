@@ -127,6 +127,144 @@ class SessionTests(unittest.TestCase):
         pump_until(lambda: (directory / "input").read_bytes() == expected)
         self.assertEqual(results, [True, True, True])
 
+    def test_image_broadcasts_keep_distinct_paths_when_queued(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        first = self.folder / "first image.png"
+        second = self.folder / "second's image.png"
+        first.write_bytes(b"fixture")
+        second.write_bytes(b"fixture")
+        results = []
+        self.assertTrue(session.broadcast("one", results.append, images=(str(first), str(second))))
+        queued = [str(second), str(first)]
+        self.assertTrue(session.broadcast("", results.append, images=queued))
+        queued.clear()
+        pump_until(lambda: len(results) == 2)
+        paste = lambda text: b"\x1b[200~" + text.encode() + b"\x1b[201~"
+        expected = (paste(shlex.quote(str(first))) + paste(shlex.quote(str(second))) + paste("one") + b"\r"
+                    + paste(shlex.quote(str(second))) + paste(shlex.quote(str(first))) + b"\r")
+        pump_until(lambda: (directory / "input").read_bytes() == expected)
+        self.assertEqual(results, [True, True])
+        self.assertNotIn(b"\x16", expected)
+
+    def test_hermes_image_path_stays_separate_from_message_paste(self):
+        session, directory = self.new_session(harness="hermes")
+        self.ready(session, directory)
+        path = self.folder / "image with spaces and 'apostrophes'.png"
+        path.write_bytes(b"fixture")
+        results = []
+        self.assertTrue(session.broadcast("describe this", results.append, images=(str(path),)))
+        pump_until(lambda: bool(results))
+        expected = (b"\x1b[200~" + (path.as_uri() + " ").encode()
+                    + b"\x1b[201~\x1b[200~describe this"
+                    + b"\x1b[201~\r")
+        pump_until(lambda: (directory / "input").read_bytes() == expected)
+        self.assertEqual(results, [True])
+
+    def test_hermes_single_image_without_text_submits_native_file_uri(self):
+        session, directory = self.new_session(harness="hermes")
+        self.ready(session, directory)
+        path = self.folder / "image's path.png"
+        path.write_bytes(b"fixture")
+        results = []
+        self.assertTrue(session.broadcast("", results.append, images=(str(path),)))
+        pump_until(lambda: bool(results))
+        expected = b"\x1b[200~" + path.as_uri().encode() + b"\x1b[201~\r"
+        pump_until(lambda: (directory / "input").read_bytes() == expected)
+        self.assertEqual(results, [True])
+
+    def test_hermes_multi_image_broadcast_keeps_ordered_file_references_in_one_turn(self):
+        session, directory = self.new_session(harness="hermes")
+        self.ready(session, directory)
+        images = (self.folder / "first.png", self.folder / "second's image.png",
+                  self.folder / 'third "image".png')
+        for path in images:
+            path.write_bytes(b"fixture")
+        results = []
+        expected = b""
+        for text in ("", "compare these"):
+            self.assertTrue(session.broadcast(text, results.append,
+                                              images=tuple(str(path) for path in images)))
+            note = ("Additional image attachments (local files, in paste order; inspect each with image tools):\n"
+                    f"Image 2: {images[1].as_uri()}\nImage 3: {images[2].as_uri()}")
+            payload = (text + "\n\n" if text else "") + note
+            expected += (b"\x1b[200~" + (images[0].as_uri() + " ").encode()
+                         + b"\x1b[201~\x1b[200~" + payload.replace("\n", "\r").encode()
+                         + b"\x1b[201~\r")
+        pump_until(lambda: len(results) == 2)
+        self.assertEqual(results, [True, True])
+        pump_until(lambda: (directory / "input").read_bytes() == expected)
+        # Each complete set uses a native path and message paste, then one submit key. The
+        # references remain inside the paste, never extra submitted turns.
+        self.assertEqual(expected.count(b"\x1b[200~"), 4)
+        self.assertEqual(expected.count(b"\x1b[201~\r"), 2)
+
+    def test_custom_harness_accepts_text_without_inferred_activity_or_images(self):
+        session, directory = self.new_session(harness="custom")
+        self.ready(session, directory)
+        session.terminal.feed(b"\x1b]0;Ready\x07")
+        pump_until(lambda: session.terminal.get_window_title() == "Ready")
+        self.assertIsNone(session._read_activity())
+        self.assertFalse(session.agent_idle)
+        self.assertFalse(session.can_receive_sleeper_broadcast)
+        self.assertFalse(session.supports_image_broadcast)
+        results = []
+        path = self.folder / "image.png"
+        path.write_bytes(b"fixture")
+        self.assertFalse(session.broadcast("", results.append, images=(str(path),)))
+        self.assertTrue(session.broadcast("hello", results.append))
+        pump_until(lambda: len(results) == 2)
+        self.assertEqual(results, [False, True])
+
+    def test_close_cancels_queued_image_before_submission(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        path = self.folder / "image.png"
+        path.write_bytes(b"fixture")
+        results = []
+        self.assertTrue(session.broadcast("one", results.append))
+        self.assertTrue(session.broadcast("", results.append, images=(str(path),)))
+        session.close()
+        self.assertEqual(results, [False, False])
+
+    def test_invalid_later_image_sends_no_partial_broadcast(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        image = self.folder / "valid.png"
+        image.write_bytes(b"fixture")
+        results = []
+        for invalid in (str(self.folder / "missing.png"), 42, "\x1b[201~", str(directory)):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(session.broadcast("don't send any of this", results.append,
+                                                   images=(str(image), invalid)))
+        self.assertEqual(results, [False] * 4)
+        self.assertEqual((directory / "input").read_bytes(), b"")
+
+    def test_image_removed_while_queued_rejects_entire_attachment_set(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        first = self.folder / "first.png"
+        second = self.folder / "second.png"
+        first.write_bytes(b"fixture")
+        second.write_bytes(b"fixture")
+        results = []
+        self.assertTrue(session.broadcast("initial", results.append))
+        self.assertTrue(session.broadcast("queued", results.append, images=(str(first), str(second))))
+        second.unlink()
+        pump_until(lambda: len(results) == 2)
+        self.assertEqual(results, [True, False])
+        expected = b"\x1b[200~initial\x1b[201~\r"
+        pump_until(lambda: (directory / "input").read_bytes() == expected)
+
+    def test_image_collection_rejects_string_instead_of_treating_it_as_paths(self):
+        session, directory = self.new_session()
+        self.ready(session, directory)
+        results = []
+        self.assertFalse(session.broadcast("hello", results.append, images="/tmp/image.png"))
+        self.assertFalse(session.broadcast("hello", results.append, images=None))
+        self.assertEqual(results, [False, False])
+        self.assertEqual((directory / "input").read_bytes(), b"")
+
     def test_interrupt_sends_only_escape_and_keeps_session_running(self):
         session, directory = self.new_session()
         self.ready(session, directory)

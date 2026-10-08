@@ -30,21 +30,31 @@ If your shell setup adds these commands to `PATH`, launch SWARM from that config
 
 ## Terminals and agents
 
-Choose **Actions > Linked Agents** to turn Codex, GLM-5.3 Flash in Hermes, and DeepSeek V4.1 Flash in Hermes on or off. All three start enabled. Older two-agent settings keep their switches and enable the new DeepSeek agent. Changes are saved immediately in `$XDG_CONFIG_HOME/swarm/linked-agents.json` (normally `~/.config/swarm/linked-agents.json`) and apply across windows and future launches. Changing a switch leaves existing tabs running.
+On startup, **Startup Swarm** shows three editable agent rows with these defaults:
 
-Click **Open Swarm** in the titlebar, or choose **Swarm > Open Swarm**, to open one tab per enabled agent in the active terminal's folder. With all three enabled, you get Codex, GLM-5.3 Flash in Hermes, and DeepSeek V4.1 Flash in Hermes. Each has its own switch. Each click opens a fresh set of tabs. If all three are off, SWARM opens Linked Agents so you can enable one. If an enabled command is missing, SWARM reports it before opening any tabs.
+| Agent | Startup command |
+| --- | --- |
+| Codex | `codex --yolo` |
+| GLM-5.3 Flash · Hermes | `hermes chat --provider zai --model glm-5.3-flash --yolo` |
+| DeepSeek V4.1 Flash · Hermes | `hermes chat --provider deepseek --model deepseek-flash --reasoning max --yolo` |
+
+Edit names and commands, enable or disable rows, remove agents, or use **+ Add agent** for additional models or harnesses. Click **Save** to apply the form. Check **Don't show again at startup** to skip the dialog on future launches. Reopen it at any time through **Swarm > Adjust Startup Swarm**. Commands and this preference are saved in `$XDG_CONFIG_HOME/swarm/linked-agents.json` (normally `~/.config/swarm/linked-agents.json`). Older harness switches carry over to the default rows. Existing tabs keep their original launch command.
+
+Click **Open Swarm** in the titlebar, or choose **Swarm > Open Swarm**, to open one tab per enabled row, in order, in the active terminal's folder. Each click opens a fresh set of tabs. If no rows are enabled, SWARM opens Startup Swarm. All executables are checked before any tabs are opened. Commands accept quoted arguments and executable paths with spaces; relative executable paths use the current folder. Commands run directly; for shell expansion or pipelines, use an explicit shell command such as `bash -lc 'your command'`. The names `codex` and `hermes` honor SWARM's `--codex` and `--hermes` executable overrides.
 
 The initial terminal lets you `cd` to your project before opening a swarm. Once all swarm agents have started, that terminal closes automatically if its shell has no running jobs. Extra terminals you open yourself stay open, and a failed swarm launch keeps the initial terminal available.
 
 Codex tabs launch with `codex --yolo`. This disables Codex command approvals and its sandbox; the agent runs with your user account's permissions. Manually launched Codex keeps the options you supplied. The GLM tab launches with `hermes chat --provider zai --model glm-5.3-flash --yolo`. DeepSeek launches with `hermes chat --provider deepseek --model deepseek-flash --reasoning max --yolo`, selecting the latest V4.1 Flash model with maximum reasoning effort. [DeepSeek’s release notes](https://api-docs.deepseek.com/updates/) report stronger coding-agent results than V4 Pro on several benchmarks. Both Hermes tabs bypass command approval prompts with `--yolo` and use Hermes’s saved credentials and tools; these per-session options leave its saved default model in place. **Actions > Restart Exited Agent** restarts the tab's original harness.
 
-Press **Ctrl+T** to open another agent using the selected agent tab's model and folder: GLM from GLM, DeepSeek from DeepSeek, or Codex from Codex. From a regular terminal or with no agent selected, it opens Codex in the current folder, so you can use `cd` first. **Ctrl+Shift+T** does the same. Linked Agents switches control which harnesses **Open Swarm** opens; the shortcut follows the selected tab even if that harness's switch is off.
+Press **Ctrl+T** to open another agent using the selected agent tab's original command and folder, including custom models and harnesses. From a regular terminal or with no agent selected, it opens Codex in the current folder, so you can use `cd` first. **Ctrl+Shift+T** does the same. The shortcut and **Restart Exited Agent** keep the tab's original command even if its startup row has since been edited, disabled, or removed.
 
 **Session > New Terminal** opens another shell in the current folder. Use `cd` to change folders. New windows have their own tabs and broadcasts. Closing SWARM does not save or restore sessions.
 
 Interactive Codex launched in a shell is detected automatically, including `resume` and `fork`. Its tab becomes an agent while Codex is in the foreground. Returning to the shell, suspending it, or moving it to the background removes it from broadcasts. Background processes and noninteractive commands such as `login`, `exec`, and `app-server` are excluded.
 
-The tab spinner runs while a Codex or Hermes agent is working. The bottom-left status shows one combined agent total and running count, for example **4 agents · 2 running**. The running count follows the tab spinners. Hermes activity comes from its terminal title in the Ink interface or its live composer indicator in the classic interface; unsupported or unavailable activity stays quiet. Codex agents opened through **Ctrl+T** or **Open Swarm** move to the far left when they become idle, newest first, without changing your selected tab. You can still drag tabs around; an agent moves automatically again only when it next becomes ready.
+The tab spinner runs while a Codex or Hermes agent is working. The bottom-left status shows one combined agent total and running count, for example **4 agents · 2 running**. The running count follows the tab spinners. Hermes activity comes from its terminal title in the Ink interface or its live composer indicator in the classic interface; unsupported or unavailable activity stays quiet. Codex agents opened through **Ctrl+T** or **Open Swarm** move to the far left after their Ready status stays stable for one second, newest first, without changing your selected tab. When one starts working again, it moves behind the idle agents. You can drag tabs within either group; running tabs stay outside the finished group. Custom harnesses have unavailable activity and do not qualify for automatic idle sorting or Sleeper Broadcast.
+
+Click a tab and use **Left/Right** to navigate the tab strip. **Enter**, **Escape**, or clicking the terminal returns focus to terminal input. Typing also focuses the terminal. **Ctrl+PageUp/PageDown** switches tabs from terminal input. Right-click selected terminal text and choose **Copy**, or use **Ctrl+Shift+C**.
 
 **Swarm > Interrupt All Agents** sends Escape to each running agent in the current window, including detected manual Codex sessions, to request that it stop its current work. Agent tabs stay open. Pending broadcast deliveries and their completion alerts are cancelled; text already pasted may remain in the prompt. Shell and sign-in tabs are unaffected. Hermes uses **Ctrl+C** in its terminal to interrupt work; the Escape action does not stop Hermes work.
 
@@ -52,7 +62,11 @@ The tab spinner runs while a Codex or Hermes agent is working. The bottom-left s
 
 ## Broadcasts
 
-All broadcasts submit through terminal input. Finish CLI onboarding and leave prompts empty before sending. Each harness decides how input is handled while busy. Hermes tabs participate in Global and Custom Broadcast. Sleeper Broadcast and completion notifications remain limited to Codex. The notification option is disabled when a global broadcast includes Hermes.
+Text broadcasts submit through terminal input. Global, Sleeper, and Custom Broadcast accept multiple clipboard images: copy an image and press **Ctrl+V** in the editor, then repeat for each additional image. **Attach Clipboard Image** also appends an image. Each image has a numbered preview and its own remove button; **Clear all** removes the set. Images keep their paste order and can be sent with or without text. Sending waits until all pending clipboard reads finish.
+
+Codex receives every image as an attachment. The installed Hermes CLI accepts one image path per message, so Hermes receives the first image as an attachment and additional images as ordered local file references with a request to inspect each file. This sends the complete set in one message; Hermes needs its image tools to inspect those additional files. Other harnesses receive accompanying text only and are excluded from image-only sends. The selected model must support image input. Attachments are saved as private PNG files in `$XDG_CACHE_HOME/swarm/broadcast-images` (normally `~/.cache/swarm/broadcast-images`) and retained for queued input and conversation history. Changing the clipboard after sending does not change the attachments.
+
+Finish CLI onboarding and leave prompts empty before sending. Each harness decides how text input is handled while busy. Hermes and custom harnesses with compatible terminal input participate in Global and Custom Broadcast. Sleeper Broadcast and completion notifications remain limited to Codex. The notification option is disabled when a global broadcast includes other harnesses.
 
 | Menu | Recipients |
 | --- | --- |
@@ -79,6 +93,8 @@ An **orange percentage immediately to its right** shows the Z.ai Coding Plan usa
 A **blue percentage to the right of GLM** tracks DeepSeek prepaid API credit. DeepSeek's [balance API](https://api-docs.deepseek.com/api/get-user-balance/) reports current money, without a subscription quota or lifetime deposit total. SWARM shows the current balance as a percentage of the **highest balance it has observed**, separately for each API key and currency. It starts at 100% on the first successful check. Spending reduces it; a balance above the previous high updates the baseline. A top-up below that high increases the percentage without resetting it to 100%. Hover or click to see the actual USD/CNY balance and tracked baseline. This is a credit indicator, not a daily/weekly allowance. It refreshes every minute and clears to **—%** if a request fails. Balance checks do not send model prompts.
 
 Configure `DEEPSEEK_API_KEY` in `~/.hermes/.env` (or your `HERMES_HOME/.env`). Local credential files such as `deepseek.txt` are ignored by Git. SWARM never passes the key in process arguments. Balance baselines are stored under `$XDG_STATE_HOME/swarm/deepseek-balance.json` (normally `~/.local/state/swarm/deepseek-balance.json`), identified by a hash of the key. Keep this file to preserve the baseline across launches. Older Hermes versions may display the compatibility alias `deepseek-v4-flash`; DeepSeek currently routes that alias to V4.1 Flash.
+
+SWARM also checks `deepseek.txt` in its source folder at startup and every two seconds while running. Paste a new key into that file, either as a plain `sk-…` key or as `DEEPSEEK_API_KEY=sk-…`; if you append keys, the last key wins. SWARM automatically updates Hermes's `.env`, preserves other settings, and refreshes the blue balance indicator. Missing, empty, or malformed files leave the saved key in place. The `.env` update is atomic and written with owner-only permissions. Open a new DeepSeek tab to use a changed key in an agent; running tabs keep their existing credentials. User-local installations remember the original source file's location. Set `SWARM_DEEPSEEK_KEY_FILE=/absolute/path/to/deepseek.txt` to watch a different file, including with Debian package installations.
 
 ## Optional installation
 
@@ -116,16 +132,19 @@ Building needs no root access. Remove the package with `sudo apt remove swarm-te
 | Close tab | Ctrl+Shift+W |
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
 | Previous / next tab | Ctrl+PageUp / Ctrl+PageDown |
+| Previous / next tab after clicking a tab | Left / Right |
 | Fullscreen | F11 |
 
 ## Source
 
 - `swarm`: launcher; `swarm_app/__main__.py`: command-line options.
 - `app.py`: windows, menus, and broadcast controls.
+- `clipboard_image.py`: clipboard image attachments for broadcasts.
 - `session.py`: terminal sessions and message delivery.
 - `activity.py` and `codex_detection.py`: activity and foreground process detection.
 - `custom_broadcast.py`: recipient picker; `usage.py`: Codex usage queries; `zai_usage.py`: Z.ai Coding Plan usage queries; `deepseek_usage.py`: DeepSeek prepaid balance tracking using Hermes credentials.
-- `linked_agents.py` and `linked_agents_dialog.py`: saved harness switches and their configuration window.
+- `deepseek_credentials.py`: automatic `deepseek.txt` synchronization into Hermes credentials.
+- `linked_agents.py` and `linked_agents_dialog.py`: saved startup commands and their configuration window.
 - `notifications.py`: desktop completion alerts.
 - `scripts/` and `packaging/`: installation and Debian packaging.
 - `tests/`: terminal fixtures and tests.

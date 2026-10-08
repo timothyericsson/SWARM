@@ -30,7 +30,8 @@ class ZaiUsageWindowTests(unittest.TestCase):
         cls.fetch_patch.start()
         cls.addClassCleanup(cls.fetch_patch.stop)
         cls.app = SwarmApplication("/tmp", "/no-such-swarm-codex", "/no-such-swarm-hermes",
-                                   linked_agents_path=Path(cls.config_temp.name) / "linked-agents.json")
+                                   linked_agents_path=Path(cls.config_temp.name) / "linked-agents.json",
+                                   deepseek_key_path=Path(cls.config_temp.name) / "deepseek.txt")
         cls.app.set_application_id("io.swarm.Terminal.ZaiUsageTests")
         if not cls.app.register(None):
             raise AssertionError("The test application could not register")
@@ -250,7 +251,8 @@ class ZaiUsageWindowTests(unittest.TestCase):
 class ZaiUsageShutdownTests(unittest.TestCase):
     def test_shutdown_cancels_both_provider_requests_and_removes_poll(self):
         with tempfile.TemporaryDirectory() as directory:
-            app = SwarmApplication(directory, linked_agents_path=Path(directory) / "linked-agents.json")
+            app = SwarmApplication(directory, linked_agents_path=Path(directory) / "linked-agents.json",
+                                   deepseek_key_path=Path(directory) / "deepseek.txt")
             app.set_application_id("io.swarm.Terminal.ZaiUsageShutdownTests")
             self.assertTrue(app.register(None))
             codex_cancel = threading.Event()

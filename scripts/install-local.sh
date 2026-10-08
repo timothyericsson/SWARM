@@ -36,6 +36,7 @@ shutil.copy2(source / "swarm", target / "swarm")
 shutil.copytree(source / "swarm_app", target / "swarm_app", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 shutil.copy2(source / "LICENSE", target / "LICENSE")
 (target / ".swarm-installation").write_text("SWARM local installation\n")
+(target / ".deepseek-key-source").write_text(str(source / "deepseek.txt") + "\n")
 PY
 chmod 755 "$staging/swarm"
 if [ -d "$app_dir" ]; then

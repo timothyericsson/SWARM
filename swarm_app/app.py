@@ -20,15 +20,18 @@ gi.require_version("Vte", "2.91")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, Vte
 
 from . import __version__
-from .activity import codex_agent_command
+from .activity import ACTIVITY_TITLE_CONFIG
 from .custom_broadcast import CustomBroadcastDialog
-from .linked_agents import HARNESS_NAMES, LinkedAgentsSettings, agent_command
+from .clipboard_image import ClipboardImageAttachment, save_broadcast_images
+from .linked_agents import (LinkedAgentsSettings, command_harness, default_startup_agents,
+                            parse_startup_command)
 from .linked_agents_dialog import LinkedAgentsDialog
 from .notifications import notify_agents_finished
 from .session import TerminalSession, normalize_message
 from .usage import UsageUnavailable, fetch_usage
 from .zai_usage import fetch_zai_usage
 from .deepseek_usage import fetch_deepseek_usage
+from .deepseek_credentials import DeepSeekKeyError, DeepSeekKeySync
 
 
 CSS = b"""
@@ -58,6 +61,8 @@ notebook > header > tabs > tab:checked { border-top: 2px solid #88c5ad; }
 """
 
 BROADCAST_READY_SECONDS = 1.0
+IDLE_TAB_REORDER_DELAY_MS = 1000
+DEEPSEEK_KEY_POLL_SECONDS = 2
 
 
 @dataclass(eq=False)
@@ -157,6 +162,8 @@ class BroadcastDialog(Gtk.Dialog):
         scroll.set_shadow_type(Gtk.ShadowType.IN)
         scroll.add(self.editor)
         content.pack_start(scroll, True, True, 0)
+        self.image_attachment = ClipboardImageAttachment(self._changed)
+        content.pack_start(self.image_attachment, False, False, 0)
         self.notification_options = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.notify_checkbox = Gtk.CheckButton(label="Notify me when these agents finish")
         self.notification_options.pack_start(self.notify_checkbox, False, False, 0)
@@ -169,6 +176,7 @@ class BroadcastDialog(Gtk.Dialog):
         content.pack_start(self.feedback, False, False, 0)
         self.editor.get_buffer().connect("changed", self._changed)
         self.editor.connect("key-press-event", self._key_press)
+        self.editor.connect("paste-clipboard", self.image_attachment.handle_paste_signal)
         self.connect("response", self._response)
         self.connect("destroy", self._destroyed)
         self.refresh_source = GLib.timeout_add(250, self._refresh)
@@ -192,7 +200,13 @@ class BroadcastDialog(Gtk.Dialog):
     def _refresh(self):
         targets = self.owner.ready_agents() if self.idle_only else self.owner.active_agents()
         count = len(targets)
-        can_notify = not self.idle_only and bool(targets) and all(session.harness == "codex" for session in targets)
+        message = self.text()
+        images = self.image_attachment.images
+        image_only = bool(images) and not message.strip()
+        notification_targets = ([session for session in targets if session.supports_image_broadcast]
+                                if image_only else targets)
+        can_notify = (not self.idle_only and bool(notification_targets)
+                      and all(session.harness == "codex" for session in notification_targets))
         self.notification_options.set_visible(not self.idle_only)
         self.notify_checkbox.set_sensitive(can_notify)
         if not can_notify:
@@ -210,7 +224,6 @@ class BroadcastDialog(Gtk.Dialog):
         self.summary.set_text(summary)
         self.send_button.set_label(f"Send to {recipients}")
         valid = False
-        message = self.text()
         if message.strip():
             try:
                 normalize_message(message)
@@ -218,9 +231,19 @@ class BroadcastDialog(Gtk.Dialog):
                 self.feedback.set_text("Ctrl+Enter to send · Enter for a new line")
             except ValueError as error:
                 self.feedback.set_text(str(error))
+        elif images:
+            valid = True
+            self.feedback.set_text("Ctrl+Enter to send · Enter for a new line")
         else:
             self.feedback.set_text("Ctrl+Enter to send · Enter for a new line")
-        self.send_button.set_sensitive(count > 0 and valid)
+        if image_only:
+            image_count = sum(session.supports_image_broadcast for session in targets)
+            attachments = f"{len(images)} image{'s' if len(images) != 1 else ''}"
+            self.summary.set_text(f"Send {attachments} to {image_count} Codex or Hermes agents in this window.")
+            self.send_button.set_label(
+                f"Send {attachments} to {image_count} agent{'s' if image_count != 1 else ''}")
+            count = image_count
+        self.send_button.set_sensitive(count > 0 and valid and not self.image_attachment.pending)
         return GLib.SOURCE_CONTINUE
 
     def _key_press(self, _widget, event):
@@ -236,7 +259,8 @@ class BroadcastDialog(Gtk.Dialog):
                 return
             sent = self.owner.broadcast(
                 self.text(), idle_only=self.idle_only,
-                notify_when_done=not self.idle_only and self.notify_checkbox.get_active())
+                notify_when_done=not self.idle_only and self.notify_checkbox.get_active(),
+                images=tuple(self.image_attachment.images))
             if not sent:
                 self._refresh()
                 return
@@ -259,6 +283,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.tab_labels = {}
         self.tab_spinners = {}
         self.idle_agents = set()
+        self.idle_reorder_sources = {}
+        self.reordering_tabs = False
         self.agent_number = 0
         self.terminal_number = 0
         self.workspace_session = None
@@ -312,6 +338,9 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.notebook.set_scrollable(True)
         self.notebook.set_show_border(False)
         self.notebook.connect("switch-page", self._switched)
+        self.notebook.connect("button-release-event", self._tab_strip_released)
+        self.notebook.connect("key-press-event", self._tab_strip_key_press)
+        self.notebook.connect("page-reordered", self._tab_reordered)
         self.stack.add_named(self.notebook, "sessions")
         layout.pack_start(self.stack, True, True, 0)
         status = Gtk.Box(spacing=20)
@@ -375,7 +404,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         badge.pack_start(self.deepseek_usage_button, False, False, 0)
         header.pack_start(badge)
         self.open_swarm_button = Gtk.Button(label="Open Swarm")
-        self.open_swarm_button.set_tooltip_text("Open one agent tab for each enabled harness in the current folder")
+        self.open_swarm_button.set_tooltip_text("Open the configured startup agents in the current folder")
         self.open_swarm_button.connect("clicked", lambda *_: self.open_swarm())
         header.pack_end(self.open_swarm_button)
         self._create_usage_panel()
@@ -628,6 +657,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
             if not snapshot.available:
                 rows.append("DeepSeek reports insufficient credit for API calls. Top up your account.")
         detail = "\n\n".join(rows)
+        if self.app.deepseek_key_error:
+            detail += "\n\n" + self.app.deepseek_key_error
         self.deepseek_usage_details.set_text(detail)
         updated = local_usage_time(self.app.deepseek_usage_updated_at)
         self.deepseek_usage_updated.set_text("Refreshing…" if self.app.deepseek_usage_pending else
@@ -677,6 +708,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
         swarm = menu("S_warm")
         self.open_swarm_item = item(swarm, "_Open Swarm", self.open_swarm)
+        self.linked_agents_item = item(swarm, "_Adjust Startup Swarm…", self.open_linked_agents)
         separator(swarm)
         self.global_item = item(swarm, "_Global Broadcast…", self.open_broadcast, "<Primary><Shift>b")
         self.sleeper_item = item(swarm, "_Sleeper Broadcast…", self.open_sleeper_broadcast)
@@ -686,8 +718,6 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.kill_all_agents_item = item(swarm, "_Kill All Agents", self.kill_all_agents)
 
         actions = menu("_Actions")
-        self.linked_agents_item = item(actions, "_Linked Agents…", self.open_linked_agents)
-        separator(actions)
         item(actions, "_Rename Agent…", self.rename_current)
         item(actions, "_Restart Exited Agent", self.restart_current)
 
@@ -717,7 +747,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
             return str(Path(executable).resolve())
         self.message("Codex CLI was not found",
                      "Install Codex CLI and make sure codex is on your PATH, or start SWARM "
-                     "with --codex /path/to/codex. You can also turn Codex off in Actions → Linked Agents.")
+                     "with --codex /path/to/codex. You can also edit its command in Swarm → Adjust Startup Swarm.")
         return None
 
     def _new_agent_shortcut(self, *_):
@@ -727,23 +757,68 @@ class SwarmWindow(Gtk.ApplicationWindow):
     def new_agent(self):
         if self.closing:
             return
-        source = self.current()
-        profile = source.agent_profile if source is not None and source.kind == "agent" else "codex"
-        harness = "codex" if profile == "codex" else "hermes"
-        if harness == "codex" and self.app.logout_pending:
+        agent = self._session_startup_agent(self.current())
+        if self._startup_harness(agent) == "codex" and self.app.logout_pending:
             self.flash("Wait for sign-out to finish before opening an agent")
-            return
-        executable = self.resolve_harness(harness)
-        if not executable:
             return
         directory = self._directory_for_new_session()
         if directory is None:
             return
-        self.agent_number += 1
-        argv = codex_agent_command(executable) if profile == "codex" else agent_command(executable, profile)
-        return self.add_session(f"{HARNESS_NAMES[profile]} {self.agent_number}", "agent", argv,
-                                directory, managed_activity_title=harness == "codex", harness=harness,
-                                agent_profile=profile)
+        command = self._resolve_startup_command(agent, directory)
+        if command is not None:
+            return self._launch_startup_agent(agent, command, directory)
+
+    def _session_startup_agent(self, session):
+        if session is not None and session.kind == "agent":
+            saved = getattr(session, "startup_agent", None)
+            if saved is not None:
+                return saved
+            profile = session.agent_profile
+        else:
+            profile = "codex"
+        defaults = default_startup_agents()
+        return next((agent for agent in defaults if agent.id == profile), defaults[0])
+
+    def _startup_harness(self, agent):
+        return command_harness(parse_startup_command(agent.command),
+                               codex=self.app.codex, hermes=self.app.hermes)
+
+    def _resolve_startup_command(self, agent, directory):
+        argv = parse_startup_command(agent.command)
+        harness = self._startup_harness(agent)
+        if argv[0] in {"codex", "hermes"}:
+            executable = self.resolve_harness(argv[0])
+        else:
+            requested = os.path.expanduser(argv[0])
+            if "/" in requested and not os.path.isabs(requested):
+                requested = os.path.join(directory, requested)
+            executable = shutil.which(requested)
+            if executable is None:
+                self.message(f"Could not find the command for {agent.name}",
+                             f"{argv[0]} is not executable or is not on your PATH. "
+                             "Edit it in Swarm → Adjust Startup Swarm.")
+        if executable is None:
+            return None
+        argv[0] = executable
+        if harness == "codex":
+            # Keep the editable command readable while requesting the status
+            # needed by the tab spinner, idle ordering, and Sleeper Broadcast.
+            position = argv.index("--") if "--" in argv else len(argv)
+            argv[position:position] = ["-c", ACTIVITY_TITLE_CONFIG]
+        return argv, harness
+
+    def _launch_startup_agent(self, agent, command, directory, *, title=None):
+        argv, harness = command
+        if title is None:
+            self.agent_number += 1
+            title = f"{agent.name} {self.agent_number}"
+        session = self.add_session(title, "agent", argv, directory,
+                                   managed_activity_title=harness == "codex", harness=harness,
+                                   agent_profile=agent.id)
+        # Cloning/restarting a tab keeps its launch command even if the saved
+        # swarm is subsequently edited or that row is removed.
+        session.startup_agent = agent
+        return session
 
     def open_linked_agents(self):
         if self.closing:
@@ -760,18 +835,18 @@ class SwarmWindow(Gtk.ApplicationWindow):
             return str(Path(executable).resolve())
         self.message("Hermes CLI was not found",
                      "Install Hermes and make sure hermes is on your PATH, or start SWARM "
-                     "with --hermes /path/to/hermes. You can also turn Hermes off in Actions → Linked Agents.")
+                     "with --hermes /path/to/hermes. You can also edit its command in Swarm → Adjust Startup Swarm.")
         return None
 
     def open_swarm(self):
         if self.closing:
             return []
-        enabled = [harness for harness in HARNESS_NAMES if self.app.linked_agents.enabled[harness]]
+        enabled = [agent for agent in self.app.linked_agents.agents if agent.enabled]
         if not enabled:
-            self.message("No linked agents enabled", "Turn on an agent in Actions → Linked Agents.")
+            self.message("No startup agents enabled", "Add or enable an agent in Swarm → Adjust Startup Swarm.")
             self.open_linked_agents()
             return []
-        if "codex" in enabled and self.app.logout_pending:
+        if self.app.logout_pending and any(self._startup_harness(agent) == "codex" for agent in enabled):
             self.flash("Wait for Codex sign-out to finish before opening a swarm")
             return []
         directory = self._directory_for_new_session()
@@ -779,20 +854,15 @@ class SwarmWindow(Gtk.ApplicationWindow):
             return []
         # Resolve every enabled command before spawning, so a missing harness
         # does not leave a partially opened swarm or change the chosen folder.
-        executables = {}
-        for harness in enabled:
-            executable = self.resolve_harness(harness)
-            if executable is None:
+        commands = []
+        for agent in enabled:
+            command = self._resolve_startup_command(agent, directory)
+            if command is None:
                 return []
-            executables[harness] = executable
+            commands.append((agent, command))
         sessions = []
-        for harness, executable in executables.items():
-            self.agent_number += 1
-            argv = codex_agent_command(executable) if harness == "codex" else agent_command(executable, harness)
-            sessions.append(self.add_session(f"{HARNESS_NAMES[harness]} {self.agent_number}", "agent", argv,
-                                             directory, managed_activity_title=harness == "codex",
-                                             harness="codex" if harness == "codex" else "hermes",
-                                             agent_profile=harness))
+        for agent, command in commands:
+            sessions.append(self._launch_startup_agent(agent, command, directory))
         if self.startup_terminal in self.sessions and self.startup_terminal.is_idle_shell:
             self._startup_swarm = sessions
             self._close_startup_terminal_after_swarm()
@@ -998,23 +1068,59 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
     def _move_newly_idle_agent(self, session):
         if not session.agent_idle:
-            self.idle_agents.discard(session)
+            self._cancel_idle_reorder(session)
+            if session in self.idle_agents:
+                self.idle_agents.discard(session)
+                self._reorder_idle_agents()
             return
-        if session in self.idle_agents:
+        if session in self.idle_agents or session in self.idle_reorder_sources:
             return
-        # Move once on entry to Ready, so polling and renaming cannot undo a
-        # user's tab order. Broadcast eligibility/cooldowns are independent.
+
+        self.idle_reorder_sources[session] = GLib.timeout_add(
+            IDLE_TAB_REORDER_DELAY_MS, self._finish_idle_agent_reorder, session)
+
+    def _cancel_idle_reorder(self, session):
+        source = self.idle_reorder_sources.pop(session, 0)
+        if source:
+            GLib.source_remove(source)
+
+    def _finish_idle_agent_reorder(self, session):
+        self.idle_reorder_sources.pop(session, None)
+        if self.closing or session not in self.sessions or not session.agent_idle:
+            return GLib.SOURCE_REMOVE
         self.idle_agents.add(session)
-        if self.notebook.page_num(session) <= 0:
+        self._reorder_idle_agents(newest=session)
+        return GLib.SOURCE_REMOVE
+
+    def _reorder_idle_agents(self, newest=None):
+        if self.reordering_tabs:
             return
+        pages = [self.notebook.get_nth_page(index)
+                 for index in range(self.notebook.get_n_pages())]
+        idle = [page for page in pages if page in self.idle_agents and page.agent_idle]
+        self.idle_agents.intersection_update(idle)
+        if newest in idle:
+            idle.remove(newest)
+            idle.insert(0, newest)
+        ordered = idle + [page for page in pages if page not in self.idle_agents]
         selected = self.current()
-        self.notebook.reorder_child(session, 0)
-        # Reordering keeps the same page selected; never switch to the agent
-        # that just finished or grab focus away from another input widget.
-        if selected is not None and self.current() is not selected:
-            index = self.notebook.page_num(selected)
-            if index >= 0:
-                self.notebook.set_current_page(index)
+        self.reordering_tabs = True
+        try:
+            for index, page in enumerate(ordered):
+                if self.notebook.page_num(page) != index:
+                    self.notebook.reorder_child(page, index)
+            # Reordering keeps the selected page and input focus unchanged.
+            if selected is not None and self.current() is not selected:
+                index = self.notebook.page_num(selected)
+                if index >= 0:
+                    self.notebook.set_current_page(index)
+        finally:
+            self.reordering_tabs = False
+
+    def _tab_reordered(self, _notebook, _session, _index):
+        # Dragging can reorder either group, but working tabs must never split
+        # the confirmed Ready group at the left of the strip.
+        self._reorder_idle_agents()
 
     def _update_agent_spinner(self, session):
         spinner = self.tab_spinners.get(session)
@@ -1070,6 +1176,38 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
     def current(self):
         return self.notebook.get_nth_page(self.notebook.get_current_page())
+
+    def _tab_strip_released(self, notebook, event):
+        # GTK normally carries focus into the newly selected page. Explicitly
+        # focus its tab strip after a click so native Left/Right navigation is
+        # consistent, including a click on the already selected tab. Events
+        # from the terminal, scrollbar, or tab close button keep their focus.
+        if event.button == 1 and Gtk.get_event_widget(event) is notebook:
+            notebook.grab_focus()
+        return False
+
+    def _tab_strip_key_press(self, notebook, event):
+        if not notebook.is_focus():
+            return False
+        modifiers = event.state & Gtk.accelerator_get_default_mod_mask()
+        if modifiers & ~Gdk.ModifierType.SHIFT_MASK:
+            return False
+        session = self.current()
+        if session is None:
+            return False
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_Escape) and not modifiers:
+            session.terminal.grab_focus()
+            return True
+        character = Gdk.keyval_to_unicode(event.keyval)
+        if event.keyval != Gdk.KEY_BackSpace and not (character and chr(character).isprintable()):
+            return False
+        # Clicking a tab must still allow immediate typing. Redispatch the
+        # original key through GTK after moving focus, preserving layouts and
+        # VTE input handling. The focus check above prevents re-entry if an
+        # unhandled event bubbles up from the terminal.
+        session.terminal.grab_focus()
+        self.propagate_key_event(event)
+        return True
 
     def _switched(self, _notebook, session, _index):
         if session.kind in ("shell", "agent"):
@@ -1151,12 +1289,18 @@ class SwarmWindow(Gtk.ApplicationWindow):
         else:
             self.broadcast_dialog = BroadcastDialog(self, idle_only=idle_only)
 
-    def broadcast(self, message, *, idle_only=False, recipients=None, notify_when_done=False):
+    def broadcast(self, message, *, idle_only=False, recipients=None, notify_when_done=False,
+                  images=()):
+        images = tuple(images)
         try:
-            message = normalize_message(message)
+            if images and isinstance(message, str) and not message.strip():
+                message = ""
+            else:
+                message = normalize_message(message)
         except ValueError as error:
             self.flash(str(error))
             return False
+        image_only = bool(images) and not message
         # Take the target snapshot when Send is clicked, never when the dialog opens.
         targets = self.ready_agents() if idle_only else self.active_agents()
         custom = recipients is not None
@@ -1164,8 +1308,13 @@ class SwarmWindow(Gtk.ApplicationWindow):
             recipients = dict(recipients)
             targets = [session for session in targets if session in recipients
                        and session.broadcast_identity == recipients[session]]
+        if image_only:
+            targets = [session for session in targets if session.supports_image_broadcast]
         if not targets:
-            if custom:
+            if image_only:
+                self.flash("No selected agents support image attachments" if custom
+                           else "No Codex or Hermes agents can receive the images")
+            elif custom:
                 self.flash("No selected agents can receive a message")
             else:
                 self.flash("No idle agents ready to receive a message" if idle_only
@@ -1181,8 +1330,20 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if any(identity is None for identity in identities.values()):
             self.flash("Agent sessions changed. Please try the broadcast again.")
             return False
+        image_recipients = sum(session.supports_image_broadcast for session in targets) if images else 0
+        image_paths = ()
+        if image_recipients:
+            try:
+                image_paths = save_broadcast_images(images)
+            except (GLib.Error, RuntimeError, OSError):
+                self.flash("Could not save the image attachments. Please try again.")
+                return False
         remaining = len(targets)
-        requested = len(recipients) if custom else len(targets)
+        if custom:
+            requested = (sum(session.supports_image_broadcast for session in recipients)
+                         if image_only else len(recipients))
+        else:
+            requested = len(targets)
         delivered = 0
         # New input supersedes a pending alert for any overlapping recipient.
         self.broadcast_watches = [watch for watch in self.broadcast_watches
@@ -1204,7 +1365,16 @@ class SwarmWindow(Gtk.ApplicationWindow):
             if remaining == 0:
                 if delivered == requested:
                     name = "Custom broadcast" if custom else "Sleeper broadcast" if idle_only else "Broadcast"
-                    self.flash(f"{name} sent to {delivered} agent{'s' if delivered != 1 else ''}")
+                    attachments = f"{len(images)} image{'s' if len(images) != 1 else ''}"
+                    if image_only:
+                        result = f"{attachments} submitted to {delivered} agent{'s' if delivered != 1 else ''}"
+                    else:
+                        result = f"{name} sent to {delivered} agent{'s' if delivered != 1 else ''}"
+                        if image_recipients:
+                            result += f"; {attachments} submitted to {image_recipients}"
+                        if images and image_recipients < delivered:
+                            result += f"; {delivered - image_recipients} received text only"
+                    self.flash(result)
                 else:
                     self.flash(f"Sent to {delivered} agents. Not submitted to {requested - delivered}; "
                                "review their inputs.")
@@ -1215,16 +1385,18 @@ class SwarmWindow(Gtk.ApplicationWindow):
         for session in targets:
             # The session reports both accepted and rejected sends through completed.
             callback = lambda success, target=session: completed(target, success)
+            attachments = image_paths if session.supports_image_broadcast else ()
             if custom:
                 sent = session.broadcast(message, callback, idle_only=idle_only,
-                                         expected_target=recipients[session])
+                                         expected_target=recipients[session], images=attachments)
                 accepted = sent or accepted
             elif idle_only:
-                session.broadcast(message, callback, idle_only=True)
+                session.broadcast(message, callback, idle_only=True, images=attachments)
             elif notify_when_done:
-                session.broadcast(message, callback, expected_target=watch.identities[session])
+                session.broadcast(message, callback, expected_target=watch.identities[session],
+                                  images=attachments)
             else:
-                session.broadcast(message, callback)
+                session.broadcast(message, callback, images=attachments)
         return accepted if custom else True
 
     def _check_broadcast_notifications(self):
@@ -1287,14 +1459,12 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if session.harness == "codex" and self.app.logout_pending:
             self.flash("Wait for sign-out to finish before opening an agent")
             return
-        executable = self.resolve_harness(session.harness)
-        if executable:
-            title, directory, harness = session.title, session.directory, session.harness
-            profile = session.agent_profile
+        agent = self._session_startup_agent(session)
+        command = self._resolve_startup_command(agent, session.directory)
+        if command is not None:
+            title, directory = session.title, session.directory
             self.close_session(session, confirm=False)
-            argv = codex_agent_command(executable) if profile == "codex" else agent_command(executable, profile)
-            self.add_session(title, "agent", argv, directory,
-                             managed_activity_title=harness == "codex", harness=harness, agent_profile=profile)
+            self._launch_startup_agent(agent, command, directory, title=title)
 
     def close_current(self):
         if self.current():
@@ -1348,6 +1518,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.sessions.remove(session)
         self.broadcast_watches = [watch for watch in self.broadcast_watches if session not in watch.recipients]
         self.last_states.pop(session, None)
+        self._cancel_idle_reorder(session)
         self.idle_agents.discard(session)
         self.custom_selection.pop(session, None)
         self.tab_labels.pop(session, None)
@@ -1378,12 +1549,14 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if event.button != 3:
             return False
         menu = Gtk.Menu()
-        for title, callback in (("Copy", self.copy), ("Paste", self.paste), ("Global Broadcast…", self.open_broadcast)):
+        for title, callback in (
+            ("Copy", lambda: terminal.copy_clipboard_format(Vte.Format.TEXT)),
+            ("Paste", lambda: terminal.paste_clipboard()),
+            ("Global Broadcast…", self.open_broadcast),
+        ):
             item = Gtk.MenuItem(label=title)
             item.connect("activate", lambda _item, fn=callback: fn())
-            if title == "Copy":
-                item.set_sensitive(terminal.get_has_selection())
-            elif title.startswith("Global"):
+            if title.startswith("Global"):
                 item.set_sensitive(bool(self.active_agents()))
             menu.append(item)
         menu.show_all()
@@ -1427,25 +1600,28 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
     def quick_start(self):
         self.message("Using SWARM",
-                     "1. Actions → Linked Agents: choose Codex, GLM-5.3 Flash, and DeepSeek.\n"
+                     "1. Swarm → Adjust Startup Swarm: edit commands or add agents.\n"
                      "2. In the terminal, cd to your project folder.\n"
-                     "3. Click Open Swarm to open each enabled harness.\n"
+                     "3. Click Open Swarm to run the enabled commands in order.\n"
                      "4. Swarm → Global Broadcast (Ctrl+Shift+B).\n\n"
                      "Install and sign in to each CLI separately. Session sign-in is for Codex. "
                      "The orange badge shows GLM-5.3 Flash quota; the blue badge shows DeepSeek API credit. "
-                     "Ctrl+T opens a new agent using the selected agent tab's model "
-                     "and folder: Hermes from Hermes, Codex from Codex. From a shell or with no agent "
+                     "Ctrl+T opens a new agent using the selected agent tab's original command "
+                     "and folder. From a shell or with no agent "
                      "selected, it opens Codex. Ctrl+Shift+T does the same.\n\n"
                      "Open another shell with "
-                     "Session → New Terminal (Ctrl+Shift+Enter).\n\n"
+                     "Session → New Terminal (Ctrl+Shift+Enter). Click a tab and use Left/Right "
+                     "to navigate tabs; Enter returns focus to its terminal.\n\n"
                      "Codex started in a terminal automatically becomes an agent tab while it "
                      "runs in the foreground, then returns to a terminal when the shell returns. "
                      "Broadcast submits to all running agent tabs in this window. Shell prompts and sign-in "
                      "tabs are excluded. Complete Codex’s "
                      "startup prompts first and leave each harness’s message input empty. Busy sessions handle "
                      "the submitted input according to that harness’s normal behavior.\n\n"
-                     "New Codex tabs run codex --yolo, with approvals and sandboxing disabled. "
-                     "Hermes tabs select GLM-5.3 Flash or DeepSeek V4.1 Flash and run with --yolo. "
+                     "The default Codex command is codex --yolo, with approvals and sandboxing disabled. "
+                     "Default Hermes commands select GLM-5.3 Flash or DeepSeek V4.1 Flash with --yolo. "
+                     "Startup Swarm appears on launch until you save Don't show again. "
+                     "Paste an image into any broadcast editor to attach it for Codex or Hermes. "
                      "Manually started Codex keeps the options you supplied. "
                      "Sleeper Broadcast submits only to agents ready for a new message, skipping "
                      "working agents and those with unavailable status. Codex opened with Ctrl+T "
@@ -1488,6 +1664,9 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if self.flash_source:
             GLib.source_remove(self.flash_source)
             self.flash_source = 0
+        for source in self.idle_reorder_sources.values():
+            GLib.source_remove(source)
+        self.idle_reorder_sources.clear()
         for session in self.sessions:
             session.close()
         self.sessions.clear()
@@ -1503,12 +1682,14 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
 
 class SwarmApplication(Gtk.Application):
-    def __init__(self, directory, codex="codex", hermes="hermes", *, linked_agents_path=None):
+    def __init__(self, directory, codex="codex", hermes="hermes", *, linked_agents_path=None,
+                 deepseek_key_path=None):
         super().__init__(application_id="io.swarm.Terminal", flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.directory = directory
         self.codex = codex
         self.hermes = hermes
         self.linked_agents = LinkedAgentsSettings(linked_agents_path)
+        self._startup_settings_shown = False
         self.auth_status = "Checking login…"
         self.auth_state = "unknown"
         self.auth_pending = False
@@ -1533,6 +1714,9 @@ class SwarmApplication(Gtk.Application):
         self.deepseek_usage_pending = False
         self.deepseek_usage_generation = 0
         self.deepseek_usage_cancel = None
+        self.deepseek_key_sync = DeepSeekKeySync(deepseek_key_path)
+        self.deepseek_key_error = None
+        self.deepseek_key_poll = 0
 
     def set_linked_agent_enabled(self, harness, enabled):
         try:
@@ -1547,6 +1731,17 @@ class SwarmApplication(Gtk.Application):
                 window.linked_agents_dialog.refresh()
         return saved
 
+    def save_startup_swarm(self, agents, dont_show_again):
+        try:
+            self.linked_agents.save(agents, dont_show_again)
+        except (OSError, ValueError) as error:
+            self.linked_agents.load_error = str(error)
+            return False
+        for window in self.get_windows():
+            if isinstance(window, SwarmWindow) and not window.closing and window.linked_agents_dialog is not None:
+                window.linked_agents_dialog.refresh()
+        return True
+
     def do_startup(self):
         Gtk.Application.do_startup(self)
         Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
@@ -1555,8 +1750,14 @@ class SwarmApplication(Gtk.Application):
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.usage_poll = GLib.timeout_add_seconds(60, self._poll_usage)
+        self._sync_deepseek_key()
+        self.deepseek_key_poll = GLib.timeout_add_seconds(
+            DEEPSEEK_KEY_POLL_SECONDS, self._poll_deepseek_key)
 
     def do_shutdown(self):
+        if self.deepseek_key_poll:
+            GLib.source_remove(self.deepseek_key_poll)
+            self.deepseek_key_poll = 0
         if self.usage_poll:
             GLib.source_remove(self.usage_poll)
             self.usage_poll = 0
@@ -1565,8 +1766,35 @@ class SwarmApplication(Gtk.Application):
         self.invalidate_deepseek_usage("SWARM closed")
         Gtk.Application.do_shutdown(self)
 
+    def _sync_deepseek_key(self):
+        try:
+            changed = self.deepseek_key_sync.sync()
+        except DeepSeekKeyError as exc:
+            error = str(exc)
+            if error != self.deepseek_key_error:
+                self.deepseek_key_error = error
+                self.sync_deepseek_usage()
+            return
+        if self.deepseek_key_error:
+            self.deepseek_key_error = None
+            self.sync_deepseek_usage()
+        if changed:
+            self.invalidate_deepseek_usage("DeepSeek key updated. Checking credit…")
+            self.refresh_deepseek_usage()
+            for window in self.get_windows():
+                if isinstance(window, SwarmWindow) and not window.closing:
+                    window.flash("DeepSeek key updated. Open a new DeepSeek tab to use it.")
+
+    def _poll_deepseek_key(self):
+        self._sync_deepseek_key()
+        return GLib.SOURCE_CONTINUE
+
     def do_activate(self):
-        self.new_window(self.directory)
+        window = self.new_window(self.directory)
+        if not self._startup_settings_shown:
+            self._startup_settings_shown = True
+            if not self.linked_agents.dont_show_again:
+                window.open_linked_agents()
         self.refresh_auth()
         self.refresh_zai_usage()
         self.refresh_deepseek_usage()

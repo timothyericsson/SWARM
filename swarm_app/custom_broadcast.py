@@ -7,6 +7,7 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("Pango", "1.0")
 from gi.repository import Gdk, GLib, Gtk, Pango
 
+from .clipboard_image import ClipboardImageAttachment
 from .session import normalize_message
 
 
@@ -135,12 +136,15 @@ class CustomBroadcastDialog(Gtk.Dialog):
         editor_scroll.set_min_content_height(90)
         editor_scroll.add(self.editor)
         content.pack_start(editor_scroll, True, True, 0)
+        self.image_attachment = ClipboardImageAttachment(self._message_changed)
+        content.pack_start(self.image_attachment, False, False, 0)
         self.feedback = _label("Ctrl+Enter to send · Enter for a new line", muted=True)
         self.feedback.set_line_wrap(True)
         content.pack_start(self.feedback, False, False, 0)
 
         self.editor.get_buffer().connect("changed", self._message_changed)
         self.editor.connect("key-press-event", self._key_press)
+        self.editor.connect("paste-clipboard", self.image_attachment.handle_paste_signal)
         self.connect("response", self._response)
         self.connect("destroy", self._destroyed)
         self.refresh_source = GLib.timeout_add(250, self._refresh)
@@ -186,6 +190,7 @@ class CustomBroadcastDialog(Gtk.Dialog):
                     self.rows.pop(session).widget.destroy()
             selected = dict(self.owner.custom_selection)
             count = 0
+            image_count = 0
             available = False
             idle_available = False
             for session in sessions:
@@ -211,6 +216,7 @@ class CustomBroadcastDialog(Gtk.Dialog):
                 row.status.set_text(status)
                 row.checkbox.get_accessible().set_name(f"Select {session.title}: {status}")
                 count += bool(checked)
+                image_count += bool(checked and session.supports_image_broadcast)
                 available = available or usable
                 idle_available = idle_available or (usable and session.agent_idle)
             self.select_all_button.set_sensitive(available)
@@ -221,14 +227,23 @@ class CustomBroadcastDialog(Gtk.Dialog):
             valid = False
             feedback = self._send_error or "Ctrl+Enter to send · Enter for a new line"
             message = self.text()
+            images = self.image_attachment.images
             if message.strip():
                 try:
                     normalize_message(message)
                     valid = True
                 except ValueError as error:
                     feedback = str(error)
+            elif images:
+                valid = True
+                feedback = self._send_error or "Images will be sent to selected Codex and Hermes agents."
+                self.send_button.set_label(
+                    f"Send {len(images)} image{'s' if len(images) != 1 else ''} "
+                    f"to {image_count} agent{'s' if image_count != 1 else ''}")
             self.feedback.set_text(feedback)
-            self.send_button.set_sensitive(count > 0 and valid)
+            self.send_button.set_sensitive(
+                count > 0 and valid and not self.image_attachment.pending
+                and (bool(message.strip()) or image_count > 0))
         finally:
             self._updating = False
         return GLib.SOURCE_CONTINUE
@@ -246,7 +261,9 @@ class CustomBroadcastDialog(Gtk.Dialog):
             self._refresh()
             if not self.send_button.get_sensitive():
                 return
-            if not self.owner.broadcast(self.text(), recipients=dict(self.owner.custom_selection)):
+            if not self.owner.broadcast(
+                    self.text(), recipients=dict(self.owner.custom_selection),
+                    images=tuple(self.image_attachment.images)):
                 self._send_error = "Could not send. Review the selection and try again."
                 self._refresh()
                 return

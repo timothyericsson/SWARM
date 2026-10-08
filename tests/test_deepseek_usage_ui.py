@@ -29,7 +29,8 @@ class DeepSeekUsageWindowTests(unittest.TestCase):
             mock.start()
             cls.addClassCleanup(mock.stop)
         cls.app = SwarmApplication("/tmp", "/no-such-codex", "/no-such-hermes",
-                                   linked_agents_path=Path(cls.temp.name) / "linked-agents.json")
+                                   linked_agents_path=Path(cls.temp.name) / "linked-agents.json",
+                                   deepseek_key_path=Path(cls.temp.name) / "deepseek.txt")
         cls.app.set_application_id("io.swarm.Terminal.DeepSeekUsageTests")
         if not cls.app.register(None):
             raise AssertionError("Could not register test application")

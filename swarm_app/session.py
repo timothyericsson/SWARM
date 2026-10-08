@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
+import shlex
 import signal
 import termios
 import threading
@@ -162,8 +163,8 @@ class TerminalSession(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         if kind not in {"agent", "login", "shell"}:
             raise ValueError("Session kind must be agent, login, or shell.")
-        if harness not in {"codex", "hermes"}:
-            raise ValueError("Agent harness must be Codex or Hermes.")
+        if harness not in {"codex", "hermes", "custom"}:
+            raise ValueError("Agent harness must be Codex, Hermes, or custom.")
         self.title = title
         self.kind = kind
         self.origin_kind = kind
@@ -189,8 +190,8 @@ class TerminalSession(Gtk.Box):
         self._started = False
         self._child_exited = False
         self._cancellable = Gio.Cancellable()
-        self._pending: deque[tuple[str, Completion, tuple[int, int, int], bool]] = deque()
-        self._active: tuple[str, Completion, tuple[int, int, int], bool] | None = None
+        self._pending: deque[tuple[str, Completion, tuple[int, int, int], bool, tuple[str, ...]]] = deque()
+        self._active: tuple[str, Completion, tuple[int, int, int], bool, tuple[str, ...]] | None = None
         self._submit_source = 0
 
         self.terminal = Vte.Terminal()
@@ -238,7 +239,8 @@ class TerminalSession(Gtk.Box):
         return not self.managed_activity_title or self._read_activity() is False
 
     def _read_activity(self) -> bool | None:
-        if self.kind != "agent" or self.state != "running" or self._process is None:
+        if (self.harness == "custom" or self.kind != "agent"
+                or self.state != "running" or self._process is None):
             return None
         if self.origin_kind == "shell" and self._detected_codex is None:
             return None
@@ -456,6 +458,10 @@ class TerminalSession(Gtk.Box):
         return self._broadcast_target() is not None
 
     @property
+    def supports_image_broadcast(self) -> bool:
+        return self.harness in {"codex", "hermes"}
+
+    @property
     def broadcast_identity(self) -> tuple[int, int, int] | None:
         """The currently validated agent identity for a bound user selection."""
         return self._broadcast_target()
@@ -599,22 +605,37 @@ class TerminalSession(Gtk.Box):
         *,
         idle_only: bool = False,
         expected_target: tuple[int, int, int] | None = None,
+        images: tuple[str, ...] = (),
     ) -> bool:
-        """Deliver a paste and Enter, reporting completion once on every path.
+        """Deliver text and/or ordered saved image attachments, then Enter.
 
         Idle-only delivery requires affirmative readiness now and at each input
         step. It never waits for a busy agent or an existing delivery to finish.
         A supplied expected_target binds the send to the selected live agent,
         rejecting a replacement process that later occupies the same tab.
+        Image paths belong to a stable private cache, never the live clipboard.
         """
-        message = normalize_message(message)
+        try:
+            if isinstance(images, (str, bytes)):
+                raise TypeError("Image paths must be a collection.")
+            images = tuple(images)
+        except TypeError:
+            self._complete(on_complete, False)
+            return False
+        if (images and not self.supports_image_broadcast) or not self._valid_images(images):
+            self._complete(on_complete, False)
+            return False
+        if images and isinstance(message, str) and not message.strip():
+            message = ""
+        else:
+            message = normalize_message(message)
         target = self._broadcast_target()
         if target is None or (expected_target is not None and target != expected_target) or (
             idle_only and (self._active is not None or self._pending or not self._has_ready_title())
         ):
             self._complete(on_complete, False)
             return False
-        delivery = (message, on_complete, target, idle_only)
+        delivery = (message, on_complete, target, idle_only, images)
         self._pending.append(delivery)
         if self._active is None:
             self._begin_delivery()
@@ -625,7 +646,7 @@ class TerminalSession(Gtk.Box):
     def _begin_delivery(self) -> None:
         if self._active is not None or not self._pending:
             return
-        if self._broadcast_target() != self._pending[0][2] or (
+        if not self._valid_images(self._pending[0][4]) or self._broadcast_target() != self._pending[0][2] or (
             self._pending[0][3] and not self._has_ready_title()
         ):
             self._cancel_deliveries()
@@ -634,10 +655,44 @@ class TerminalSession(Gtk.Box):
         try:
             # VTE observes the child's bracketed-paste mode and preserves a
             # multiline prompt as a paste instead of synthetic Enter presses.
-            self.terminal.paste_text(self._active[0])
+            message, _callback, _target, _idle_only, images = self._active
+            if images and self.harness == "hermes":
+                # Hermes attaches just the first native file drop. Preserve
+                # further images as explicit local references in this same
+                # turn so its image tools can inspect the complete set.
+                image_uris = tuple(Path(path).resolve().as_uri() for path in images)
+                if len(image_uris) > 1:
+                    references = "\n".join(
+                        f"Image {number}: {uri}" for number, uri in enumerate(image_uris[1:], start=2))
+                    note = ("Additional image attachments (local files, in paste order; "
+                            "inspect each with image tools):\n" + references)
+                    message = message + "\n\n" + note if message else note
+                # Hermes may collapse a long paste into a text-file reference.
+                # Keep the native file URI in its own short paste, including
+                # its separator, so that collapse cannot hide the file drop.
+                self.terminal.paste_text(image_uris[0] + (" " if message else ""))
+                if message:
+                    self.terminal.paste_text(message)
+            else:
+                for image in images:
+                    # Codex recognizes an image when a whole paste is a path.
+                    # A separate paste keeps the message out of path parsing.
+                    self.terminal.paste_text(shlex.quote(image))
+                if message:
+                    self.terminal.paste_text(message)
             self._submit_source = GLib.timeout_add(PASTE_SETTLE_MS, self._submit)
-        except (GLib.Error, RuntimeError):
+        except (GLib.Error, RuntimeError, OSError, ValueError):
             self._cancel_deliveries()
+
+    @staticmethod
+    def _valid_images(images: tuple[str, ...]) -> bool:
+        """Validate the full set before writing even the first attachment."""
+        try:
+            return all(isinstance(path, str) and normalize_message(path) == path
+                       and not any(unicodedata.category(char) == "Cc" for char in path)
+                       and Path(path).is_file() for path in images)
+        except (OSError, ValueError):
+            return False
 
     def _submit(self) -> bool:
         self._submit_source = 0
@@ -648,7 +703,7 @@ class TerminalSession(Gtk.Box):
         ):
             self._cancel_deliveries()
             return GLib.SOURCE_REMOVE
-        _message, callback, _target, _idle_only = self._active
+        _message, callback, _target, _idle_only, _images = self._active
         self._active = None
         try:
             self.terminal.feed_child(b"\r")
@@ -674,7 +729,7 @@ class TerminalSession(Gtk.Box):
         if self._active is not None:
             cancelled.insert(0, self._active)
             self._active = None
-        for _message, callback, _target, _idle_only in cancelled:
+        for _message, callback, _target, _idle_only, _images in cancelled:
             self._complete(callback, False)
 
     def close(self) -> None:

@@ -8,6 +8,8 @@ import unittest
 import subprocess
 import shlex
 import signal
+import shutil
+from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
 
 from swarm_app.app import BroadcastDialog, Gdk, Gtk, SwarmApplication
@@ -27,7 +29,8 @@ class WindowTests(unittest.TestCase):
         usage_patch = patch("swarm_app.app.fetch_zai_usage", return_value=None)
         usage_patch.start()
         cls.addClassCleanup(usage_patch.stop)
-        cls.app = SwarmApplication("/tmp", "/no-such-swarm-codex")
+        cls.app = SwarmApplication("/tmp", "/no-such-swarm-codex",
+                                   deepseek_key_path="/no-such-swarm-deepseek.txt")
         cls.app.register(None)
         cls.app.hold()
 
@@ -233,12 +236,12 @@ class WindowTests(unittest.TestCase):
         folder = self.directory / str(len(self.sessions))
         folder.mkdir()
         argv = ["/usr/bin/python3", str(FIXTURE), str(folder), "record"]
-        with patch.object(self.window, "resolve_codex", return_value="/test/codex"), \
-                patch("swarm_app.app.codex_agent_command", return_value=argv) as command:
+        with patch.object(self.window, "_resolve_startup_command", return_value=(argv, "codex")) as command:
             activated = Gtk.accel_groups_activate(
                 self.window, Gdk.KEY_t, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
         self.assertTrue(activated)
-        command.assert_called_once_with("/test/codex")
+        command.assert_called_once()
+        self.assertEqual(command.call_args.args[0].command, "codex --yolo")
         agent = self.window.current()
         self.sessions.append(agent)
         pump_until(lambda: agent.state == "running" and (folder / "ready").exists())
@@ -537,6 +540,144 @@ class WindowTests(unittest.TestCase):
         session.terminal.feed(f"\x1b]0;{title}\x07".encode())
         pump_until(lambda: session.terminal.get_window_title() == title)
         session.refresh_activity()
+
+    def tab_order(self):
+        return [self.window.notebook.get_nth_page(index)
+                for index in range(self.window.notebook.get_n_pages())]
+
+    def test_ready_tab_waits_and_cancels_a_false_finish(self):
+        first, _ = self.add()
+        second, _ = self.add()
+        with patch("swarm_app.app.IDLE_TAB_REORDER_DELAY_MS", 180):
+            self.activity_title(second, "Ready")
+            self.assertEqual(self.tab_order(), [first, second])
+            self.assertIn(second, self.window.idle_reorder_sources)
+            self.activity_title(second, "Working")
+            self.assertNotIn(second, self.window.idle_reorder_sources)
+            started = time.monotonic()
+            pump_until(lambda: time.monotonic() - started > .22)
+            self.assertEqual(self.tab_order(), [first, second])
+            self.assertNotIn(second, self.window.idle_agents)
+            self.activity_title(second, "Ready")
+            self.assertEqual(self.tab_order(), [first, second])
+            pump_until(lambda: self.tab_order() == [second, first])
+
+    def test_ready_tabs_stay_grouped_and_keep_the_selected_page_and_focus(self):
+        first, _ = self.add()
+        second, _ = self.add()
+        third, _ = self.add()
+        self.window.notebook.set_current_page(self.window.notebook.page_num(third))
+        third.terminal.grab_focus()
+        with patch("swarm_app.app.IDLE_TAB_REORDER_DELAY_MS", 80):
+            for session in (first, second):
+                self.activity_title(session, "Ready")
+                pump_until(lambda: session in self.window.idle_agents)
+        self.assertEqual(self.tab_order(), [second, first, third])
+        self.assertIs(self.window.current(), third)
+        self.assertIs(self.window.get_focus(), third.terminal)
+        # A drag into the Ready group cannot strand a working tab between it.
+        self.window.notebook.reorder_child(third, 1)
+        self.assertEqual(self.tab_order(), [second, first, third])
+        self.activity_title(second, "Working")
+        self.assertEqual(self.tab_order(), [first, second, third])
+        self.assertIs(self.window.current(), third)
+        self.assertIs(self.window.get_focus(), third.terminal)
+
+    def test_closing_tab_cancels_pending_ready_reorder(self):
+        session, _ = self.add()
+        self.activity_title(session, "Ready")
+        self.assertIn(session, self.window.idle_reorder_sources)
+        self.window.close_session(session, confirm=False)
+        self.assertNotIn(session, self.window.idle_reorder_sources)
+        self.assertNotIn(session, self.window.idle_agents)
+
+    def test_context_copy_uses_clicked_terminal_and_stays_available(self):
+        first, _ = self.add()
+        first.terminal.feed(b"Text selected in the first terminal\x1b]0;Selection ready\x07")
+        pump_until(lambda: first.terminal.get_window_title() == "Selection ready")
+        first.terminal.select_all()
+        second, _ = self.add()
+        menus = []
+        with patch.object(Gtk.Menu, "popup_at_pointer", lambda menu, _event: menus.append(menu)):
+            self.assertTrue(self.window._terminal_menu(first.terminal, SimpleNamespace(button=3)))
+        menu = menus[0]
+        try:
+            copy = menu.get_children()[0]
+            self.assertTrue(copy.get_sensitive())
+            self.assertIs(self.window.current(), second)
+            copy.activate()
+            self.assertIn("Text selected in the first terminal",
+                          Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).wait_for_text())
+        finally:
+            menu.destroy()
+
+    def native_input(self, *args):
+        if (shutil.which("xdotool") is None
+                or Gdk.Display.get_default().__gtype__.name != "GdkX11Display"):
+            self.skipTest("Native pointer/keyboard regression requires X11 and xdotool")
+        subprocess.run(["xdotool", *args], check=True, timeout=5)
+
+    def click_widget(self, widget):
+        x, y = widget.translate_coordinates(self.window, 0, 0)
+        _ok, origin_x, origin_y = self.window.get_window().get_origin()
+        allocation = widget.get_allocation()
+        self.native_input("mousemove", str(origin_x + x + allocation.width // 2),
+                          str(origin_y + y + allocation.height // 2), "click", "1")
+
+    def test_click_tab_then_arrows_navigates_until_terminal_is_focused(self):
+        first, _ = self.add()
+        second, second_folder = self.add()
+        third, _ = self.add()
+        self.click_widget(self.window.tab_labels[second])
+        pump_until(lambda: self.window.current() is second and self.window.notebook.is_focus())
+        self.native_input("key", "Left")
+        pump_until(lambda: self.window.current() is first)
+        self.native_input("key", "Left")
+        pump_until(lambda: self.window.current() is third)
+        self.native_input("key", "Right", "Right")
+        pump_until(lambda: self.window.current() is second)
+        with patch("swarm_app.app.IDLE_TAB_REORDER_DELAY_MS", 80):
+            self.activity_title(third, "Ready")
+            pump_until(lambda: self.tab_order() == [third, first, second])
+        self.assertIs(self.window.current(), second)
+        self.assertTrue(self.window.notebook.is_focus())
+        self.native_input("key", "Right")
+        pump_until(lambda: self.window.current() is third)
+        self.native_input("key", "Left")
+        pump_until(lambda: self.window.current() is second)
+        self.native_input("key", "Return")
+        pump_until(lambda: self.window.get_focus() is second.terminal)
+        self.native_input("key", "Left", "Right")
+        pump_until(lambda: (second_folder / "input").read_bytes().endswith(b"\x1b[D\x1b[C"))
+        self.assertIs(self.window.current(), second)
+        # Clicking the selected tab again must restore strip navigation too.
+        self.click_widget(self.window.tab_labels[second])
+        pump_until(self.window.notebook.is_focus)
+        self.click_widget(second.terminal)
+        pump_until(lambda: self.window.get_focus() is second.terminal)
+        before = (second_folder / "input").stat().st_size
+        self.native_input("key", "Left")
+        pump_until(lambda: (second_folder / "input").stat().st_size > before)
+        self.assertIs(self.window.current(), second)
+
+    def test_click_tab_then_typing_keeps_the_first_key_and_backspace(self):
+        first, folder = self.add()
+        self.add()
+        self.click_widget(self.window.tab_labels[first])
+        pump_until(self.window.notebook.is_focus)
+        self.native_input("key", "a")
+        pump_until(lambda: (folder / "input").read_bytes() == b"a")
+        self.assertIs(self.window.get_focus(), first.terminal)
+        self.click_widget(self.window.tab_labels[first])
+        pump_until(self.window.notebook.is_focus)
+        self.native_input("key", "BackSpace")
+        pump_until(lambda: (folder / "input").read_bytes() == b"a\x7f")
+        self.assertIs(self.window.get_focus(), first.terminal)
+        self.click_widget(self.window.tab_labels[first])
+        pump_until(self.window.notebook.is_focus)
+        self.native_input("key", "shift+a")
+        pump_until(lambda: (folder / "input").read_bytes() == b"a\x7fA")
+        self.assertIs(self.window.get_focus(), first.terminal)
 
     def test_interrupt_all_agents_menu_order_and_sensitivity(self):
         item = self.window.interrupt_all_agents_item
