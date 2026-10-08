@@ -21,6 +21,60 @@ class StartupAgent:
     enabled: bool = True
 
 
+def uses_default_usage_account(agent, harness):
+    """Whether implicit usage can safely reuse the user's default CLI account.
+
+    Explicitly assigned SWARM credentials are handled separately by callers.
+    A CLI profile, remote server or local/custom model provider may authenticate
+    elsewhere; never attach the default account's percentage to that launch.
+    """
+    if harness not in {"codex", "hermes"}:
+        return False
+    try:
+        argv = shlex.split(agent.command)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not argv:
+        return False
+    arguments = argv[1:argv.index("--")] if "--" in argv else argv[1:]
+    provider = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        index += 1
+        if (argument in {"--profile", "-p"} or argument.startswith("--profile=")
+                or argument.startswith("-p") and not argument.startswith("--")):
+            return False
+        if harness != "codex":
+            continue
+        if (argument in {"--oss", "--local-provider", "--remote"}
+                or argument.startswith(("--oss=", "--local-provider=", "--remote="))):
+            return False
+        setting = None
+        if argument in {"-c", "--config"}:
+            if index == len(arguments):
+                return False
+            setting = arguments[index]
+            index += 1
+        elif argument.startswith("--config="):
+            setting = argument[len("--config="):]
+        elif argument.startswith("-c") and not argument.startswith("--"):
+            setting = argument[2:]
+        if setting is not None:
+            name, separator, value = setting.partition("=")
+            name = name.strip()
+            if name == "model_provider":
+                if not separator:
+                    return False
+                # Codex accepts a raw string or a quoted TOML string. Only the
+                # known built-in provider may reuse its normal account read.
+                provider = "openai" if value.strip() in {"openai", '"openai"', "'openai'"} else "custom"
+            elif name == "model_providers.openai" or name.startswith("model_providers.openai."):
+                return False
+    return provider in {None, "openai"}
+
+
+
 def parse_startup_command(command):
     if not isinstance(command, str) or not command.strip():
         raise ValueError("Enter a startup command for each agent.")

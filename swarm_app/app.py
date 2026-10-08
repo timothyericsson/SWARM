@@ -23,6 +23,9 @@ from . import __version__
 from .activity import ACTIVITY_TITLE_CONFIG
 from .custom_broadcast import CustomBroadcastDialog
 from .clipboard_image import ClipboardImageAttachment, save_broadcast_images
+from .credentials import CredentialStore, PROVIDERS, parse_key, provider_for_agent
+from .credentials_dialog import CredentialsDialog
+from .agent_usage import AgentUsageBadge, AgentUsageManager, uses_default_usage_account
 from .linked_agents import (LinkedAgentsSettings, command_harness, default_startup_agents,
                             parse_startup_command)
 from .linked_agents_dialog import LinkedAgentsDialog
@@ -297,6 +300,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.broadcast_dialog = None
         self.custom_broadcast_dialog = None
         self.linked_agents_dialog = None
+        self.credentials_dialog = None
+        self.agent_usage_badges = {}
         self.custom_selection = {}
         self.broadcast_watches = []
         self.flash_source = 0
@@ -362,6 +367,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.update_usage()
         self.update_zai_usage()
         self.update_deepseek_usage()
+        self.update_agent_usage()
         self.directory_poll = GLib.timeout_add(400, self._poll_directory)
 
     def _title_bar(self):
@@ -391,7 +397,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.zai_usage_button.set_focus_on_click(False)
         self.zai_usage_button.get_style_context().add_class("usage-badge")
         self.zai_usage_button.get_style_context().add_class("zai-usage-badge")
-        self.zai_usage_button.get_accessible().set_name("GLM-5.3 Flash usage remaining")
+        self.zai_usage_button.get_accessible().set_name("GLM / Z.ai Coding Plan usage remaining")
         self.zai_usage_button.connect("clicked", self._zai_usage_clicked)
         badge.pack_start(self.zai_usage_button, False, False, 0)
         self.deepseek_usage_button = Gtk.Button(label="—%")
@@ -402,6 +408,14 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.deepseek_usage_button.get_accessible().set_name("DeepSeek credit remaining")
         self.deepseek_usage_button.connect("clicked", self._deepseek_usage_clicked)
         badge.pack_start(self.deepseek_usage_button, False, False, 0)
+        self.extra_usage_box = Gtk.Box(spacing=4)
+        self.extra_usage_scroll = Gtk.ScrolledWindow()
+        self.extra_usage_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self.extra_usage_scroll.set_propagate_natural_width(True)
+        self.extra_usage_scroll.set_max_content_width(360)
+        self.extra_usage_scroll.set_no_show_all(True)
+        self.extra_usage_scroll.add(self.extra_usage_box)
+        badge.pack_start(self.extra_usage_scroll, False, False, 0)
         header.pack_start(badge)
         self.open_swarm_button = Gtk.Button(label="Open Swarm")
         self.open_swarm_button.set_tooltip_text("Open the configured startup agents in the current folder")
@@ -412,6 +426,29 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self._create_deepseek_usage_panel()
         header.show_all()
         return header
+
+    def update_agent_usage(self):
+        if not hasattr(self, "extra_usage_box"):
+            return
+        legacy = self.app.legacy_usage_agents()
+        for name, button in (("codex", self.usage_button), ("zai", self.zai_usage_button),
+                             ("deepseek", self.deepseek_usage_button)):
+            button.set_visible(name in legacy)
+        states = self.app.agent_usage.states
+        for identity in tuple(self.agent_usage_badges):
+            if identity not in states:
+                self.agent_usage_badges.pop(identity).destroy()
+        for index, (identity, state) in enumerate(states.items()):
+            if identity not in self.agent_usage_badges:
+                button = AgentUsageBadge(self.app, identity)
+                self.agent_usage_badges[identity] = button
+                self.extra_usage_box.pack_start(button, False, False, 0)
+            button = self.agent_usage_badges[identity]
+            button.update(state)
+            self.extra_usage_box.reorder_child(button, index)
+        self.extra_usage_box.show_all()
+        self.extra_usage_scroll.get_child().show()
+        self.extra_usage_scroll.set_visible(bool(states))
 
     def _create_usage_panel(self):
         self.usage_panel = Gtk.Popover.new(self.usage_button)
@@ -555,7 +592,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         content.set_border_width(16)
         heading = label("")
-        heading.set_markup("<b>GLM-5.3 Flash · Z.ai usage</b>")
+        heading.set_markup("<b>Z.ai Coding Plan usage</b>")
         content.pack_start(heading, False, False, 0)
         self.zai_usage_details = label("")
         self.zai_usage_details.set_line_wrap(True)
@@ -604,9 +641,9 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.zai_usage_updated.set_text("Refreshing…" if self.app.zai_usage_pending else
                                         f"Updated {updated}" if updated else "")
         self.zai_usage_refresh_button.set_sensitive(not self.app.zai_usage_pending)
-        self.zai_usage_button.set_tooltip_text("GLM-5.3 Flash · Z.ai\n\n" + detail + "\n\nClick to refresh")
+        self.zai_usage_button.set_tooltip_text("Z.ai Coding Plan\n\n" + detail + "\n\nClick to refresh")
         accessible = self.zai_usage_button.get_accessible()
-        accessible.set_name(f"GLM-5.3 Flash usage remaining: {self.zai_usage_button.get_label()}")
+        accessible.set_name(f"GLM / Z.ai Coding Plan usage remaining: {self.zai_usage_button.get_label()}")
         accessible.set_description(detail + "\nClick for usage details")
 
     def _create_deepseek_usage_panel(self):
@@ -615,7 +652,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         content.set_border_width(16)
         heading = label("")
-        heading.set_markup("<b>DeepSeek V4.1 Flash · API credit</b>")
+        heading.set_markup("<b>DeepSeek API credit</b>")
         content.pack_start(heading, False, False, 0)
         self.deepseek_usage_details = label("")
         self.deepseek_usage_details.set_line_wrap(True)
@@ -664,7 +701,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.deepseek_usage_updated.set_text("Refreshing…" if self.app.deepseek_usage_pending else
                                              f"Updated {updated}" if updated else "")
         self.deepseek_usage_refresh_button.set_sensitive(not self.app.deepseek_usage_pending)
-        self.deepseek_usage_button.set_tooltip_text("DeepSeek V4.1 Flash\n\n" + detail + "\n\nClick to refresh")
+        self.deepseek_usage_button.set_tooltip_text("DeepSeek API credit\n\n" + detail + "\n\nClick to refresh")
         accessible = self.deepseek_usage_button.get_accessible()
         accessible.set_name(f"DeepSeek credit remaining: {self.deepseek_usage_button.get_label()}")
         accessible.set_description(detail + "\nClick for credit details")
@@ -718,6 +755,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.kill_all_agents_item = item(swarm, "_Kill All Agents", self.kill_all_agents)
 
         actions = menu("_Actions")
+        self.add_key_item = item(actions, "Add _Key…", self.open_credentials)
+        separator(actions)
         item(actions, "_Rename Agent…", self.rename_current)
         item(actions, "_Restart Exited Agent", self.restart_current)
 
@@ -805,16 +844,24 @@ class SwarmWindow(Gtk.ApplicationWindow):
             # needed by the tab spinner, idle ordering, and Sleeper Broadcast.
             position = argv.index("--") if "--" in argv else len(argv)
             argv[position:position] = ["-c", ACTIVITY_TITLE_CONFIG]
-        return argv, harness
+        try:
+            if self.app.credentials.load_error:
+                raise ValueError(self.app.credentials.load_error)
+            argv = self.app.credentials.command_for_agent(agent, argv)
+            environment = self.app.credentials.environment_for_agent(agent)
+        except (OSError, ValueError) as error:
+            self.message("Could not apply the saved API key", str(error))
+            return None
+        return argv, harness, environment
 
     def _launch_startup_agent(self, agent, command, directory, *, title=None):
-        argv, harness = command
+        argv, harness, environment = command
         if title is None:
             self.agent_number += 1
             title = f"{agent.name} {self.agent_number}"
         session = self.add_session(title, "agent", argv, directory,
                                    managed_activity_title=harness == "codex", harness=harness,
-                                   agent_profile=agent.id)
+                                   agent_profile=agent.id, environment=environment)
         # Cloning/restarting a tab keeps its launch command even if the saved
         # swarm is subsequently edited or that row is removed.
         session.startup_agent = agent
@@ -826,6 +873,13 @@ class SwarmWindow(Gtk.ApplicationWindow):
         if self.linked_agents_dialog is None:
             self.linked_agents_dialog = LinkedAgentsDialog(self)
         self.linked_agents_dialog.present()
+
+    def open_credentials(self):
+        if self.closing:
+            return
+        if self.credentials_dialog is None:
+            self.credentials_dialog = CredentialsDialog(self)
+        self.credentials_dialog.present()
 
     def resolve_harness(self, harness):
         if harness == "codex":
@@ -973,7 +1027,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
             self.app.logout(executable)
 
     def add_session(self, title, kind, argv, directory, *, managed_activity_title=False, harness="codex",
-                    agent_profile=None):
+                    agent_profile=None, environment=None):
         session = TerminalSession(title, kind, directory, self._session_changed,
                                   managed_activity_title=managed_activity_title, harness=harness,
                                   agent_profile=agent_profile)
@@ -1022,7 +1076,10 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.stack.set_visible_child_name("sessions")
         self.notebook.set_current_page(index)
         terminal.grab_focus()
-        session.start(argv)
+        if environment:
+            session.start(argv, environment=environment)
+        else:
+            session.start(argv)
         self._update_status()
         if kind == "login":
             self.app.sync_auth_controls()
@@ -1604,8 +1661,10 @@ class SwarmWindow(Gtk.ApplicationWindow):
                      "2. In the terminal, cd to your project folder.\n"
                      "3. Click Open Swarm to run the enabled commands in order.\n"
                      "4. Swarm → Global Broadcast (Ctrl+Shift+B).\n\n"
-                     "Install and sign in to each CLI separately. Session sign-in is for Codex. "
-                     "The orange badge shows GLM-5.3 Flash quota; the blue badge shows DeepSeek API credit. "
+                     "Install each CLI, then use Actions → Add Key for provider keys. "
+                     "Session sign-in is for Codex's ChatGPT login. "
+                     "Usage badges follow enabled startup agents; unsupported providers show N/A. "
+                     "The orange badge shows Z.ai quota; the blue badge shows DeepSeek API credit. "
                      "Ctrl+T opens a new agent using the selected agent tab's original command "
                      "and folder. From a shell or with no agent "
                      "selected, it opens Codex. Ctrl+Shift+T does the same.\n\n"
@@ -1621,7 +1680,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
                      "The default Codex command is codex --yolo, with approvals and sandboxing disabled. "
                      "Default Hermes commands select GLM-5.3 Flash or DeepSeek V4.1 Flash with --yolo. "
                      "Startup Swarm appears on launch until you save Don't show again. "
-                     "Paste an image into any broadcast editor to attach it for Codex or Hermes. "
+                     "Paste images into any broadcast editor to attach them for Codex or Hermes. "
                      "Manually started Codex keeps the options you supplied. "
                      "Sleeper Broadcast submits only to agents ready for a new message, skipping "
                      "working agents and those with unavailable status. Codex opened with Ctrl+T "
@@ -1657,6 +1716,8 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.deepseek_usage_panel.destroy()
         if self.linked_agents_dialog is not None:
             self.linked_agents_dialog.destroy()
+        if self.credentials_dialog is not None:
+            self.credentials_dialog.destroy()
         had_login = any(session.kind == "login" for session in self.sessions)
         if self.directory_poll:
             GLib.source_remove(self.directory_poll)
@@ -1683,12 +1744,17 @@ class SwarmWindow(Gtk.ApplicationWindow):
 
 class SwarmApplication(Gtk.Application):
     def __init__(self, directory, codex="codex", hermes="hermes", *, linked_agents_path=None,
-                 deepseek_key_path=None):
+                 deepseek_key_path=None, credentials_path=None):
         super().__init__(application_id="io.swarm.Terminal", flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.directory = directory
         self.codex = codex
         self.hermes = hermes
         self.linked_agents = LinkedAgentsSettings(linked_agents_path)
+        if credentials_path is None and linked_agents_path is not None:
+            credentials_path = Path(linked_agents_path).parent / "credentials.json"
+        self.credentials = CredentialStore(credentials_path)
+        self.credential_error = self.credentials.load_error
+        self.agent_usage = AgentUsageManager(self.sync_agent_usage)
         self._startup_settings_shown = False
         self.auth_status = "Checking login…"
         self.auth_state = "unknown"
@@ -1714,7 +1780,8 @@ class SwarmApplication(Gtk.Application):
         self.deepseek_usage_pending = False
         self.deepseek_usage_generation = 0
         self.deepseek_usage_cancel = None
-        self.deepseek_key_sync = DeepSeekKeySync(deepseek_key_path)
+        legacy_path = deepseek_key_path or os.environ.get("SWARM_DEEPSEEK_KEY_FILE")
+        self.deepseek_key_sync = DeepSeekKeySync(legacy_path) if legacy_path else None
         self.deepseek_key_error = None
         self.deepseek_key_poll = 0
 
@@ -1729,6 +1796,8 @@ class SwarmApplication(Gtk.Application):
         for window in self.get_windows():
             if isinstance(window, SwarmWindow) and not window.closing and window.linked_agents_dialog is not None:
                 window.linked_agents_dialog.refresh()
+        if saved:
+            self.configure_agent_usage()
         return saved
 
     def save_startup_swarm(self, agents, dont_show_again):
@@ -1740,7 +1809,129 @@ class SwarmApplication(Gtk.Application):
         for window in self.get_windows():
             if isinstance(window, SwarmWindow) and not window.closing and window.linked_agents_dialog is not None:
                 window.linked_agents_dialog.refresh()
+        self.configure_agent_usage()
+        self._refresh_credential_dialogs()
+        self.invalidate_zai_usage("Startup agents updated. Checking quota…")
+        self.invalidate_deepseek_usage("Startup agents updated. Checking credit…")
+        self.refresh_zai_usage()
+        self.refresh_deepseek_usage()
         return True
+
+    def save_api_key(self, provider, key, agent_id=None, variable=None):
+        try:
+            if provider not in PROVIDERS:
+                raise ValueError("Choose a provider for this key.")
+            parsed = parse_key(key)
+            if parsed.provider is not None and parsed.provider != provider and provider != "custom":
+                raise ValueError("The key format belongs to another provider. Check the provider selection.")
+            if provider == "custom" and agent_id is None:
+                raise ValueError("Choose a startup agent for a custom environment variable.")
+            if agent_id is not None:
+                agent = next((agent for agent in self.linked_agents.agents if agent.id == agent_id), None)
+                if agent is None:
+                    raise ValueError("This startup agent was removed. Choose another target.")
+                inferred = provider_for_agent(agent)
+                harness = command_harness(parse_startup_command(agent.command),
+                                          codex=self.codex, hermes=self.hermes)
+                if harness == "codex" and provider != "openai":
+                    raise ValueError("Codex startup agents use OpenAI keys. Choose a matching startup agent.")
+                if inferred is not None and inferred != provider and provider != "custom":
+                    raise ValueError("This agent's startup command selects a different provider. "
+                                     "Change its command or choose the matching provider.")
+            self.credentials.set(provider, parsed.secret, agent_id=agent_id,
+                                 variable=variable or parsed.variable)
+        except (OSError, ValueError) as error:
+            self.credential_error = str(error)
+            return False
+        self._credentials_changed()
+        return True
+
+    def delete_api_key(self, provider, agent_id=None):
+        try:
+            self.credentials.delete(provider, agent_id=agent_id)
+        except (OSError, ValueError) as error:
+            self.credential_error = str(error)
+            return False
+        self._credentials_changed()
+        return True
+
+    def _refresh_credential_dialogs(self):
+        for window in self.get_windows():
+            if isinstance(window, SwarmWindow) and not window.closing and window.credentials_dialog is not None:
+                window.credentials_dialog.refresh()
+
+    def _credentials_changed(self):
+        self.credential_error = None
+        self.configure_agent_usage()
+        self.invalidate_zai_usage("Saved keys changed. Checking quota…")
+        self.invalidate_deepseek_usage("Saved keys changed. Checking credit…")
+        self.refresh_zai_usage()
+        self.refresh_deepseek_usage()
+        self._refresh_credential_dialogs()
+
+    def _agent_credential(self, agent):
+        try:
+            return self.credentials.credential_for_agent(agent)
+        except ValueError:
+            # A changed command must not route an old binding to a new provider.
+            return None
+
+    def legacy_usage_agents(self):
+        legacy = {}
+        if self.credentials.load_error:
+            return legacy
+        for agent in self.linked_agents.agents:
+            if not agent.enabled:
+                continue
+            try:
+                credential = self.credentials.credential_for_agent(agent)
+            except ValueError:
+                continue
+            provider = provider_for_agent(agent)
+            harness = command_harness(parse_startup_command(agent.command), codex=self.codex, hermes=self.hermes)
+            if credential is None and not uses_default_usage_account(agent, harness):
+                continue
+            if agent.id == "codex" and provider == "openai" and credential is None:
+                legacy["codex"] = agent
+            elif ((agent.id, provider) in {("hermes", "zai"), ("deepseek", "deepseek")}
+                  and (credential is None or credential.provider == provider)):
+                legacy[provider] = agent
+        return legacy
+
+    def configure_agent_usage(self):
+        legacy_ids = {agent.id for agent in self.legacy_usage_agents().values()}
+        extras = []
+        errors = {}
+        for agent in self.linked_agents.agents:
+            if not agent.enabled or agent.id in legacy_ids:
+                continue
+            try:
+                if self.credentials.load_error:
+                    raise ValueError(self.credentials.load_error)
+                credential = self.credentials.credential_for_agent(agent)
+            except ValueError as error:
+                errors[agent.id] = str(error)
+                extras.append((agent, None, None))
+                continue
+            provider = credential.provider if credential is not None else provider_for_agent(agent)
+            if credential is None:
+                harness = command_harness(parse_startup_command(agent.command), codex=self.codex, hermes=self.hermes)
+                if not uses_default_usage_account(agent, harness):
+                    provider = None
+                elif harness == "codex":
+                    provider = "codex"
+            extras.append((agent, provider, credential))
+        self.agent_usage.configure(extras, errors=errors)
+
+    def sync_agent_usage(self):
+        for window in self.get_windows():
+            if isinstance(window, SwarmWindow) and not window.closing:
+                window.update_agent_usage()
+
+    def _provider_key(self, provider):
+        agent = self.legacy_usage_agents().get(provider)
+        credential = self._agent_credential(agent) if agent is not None else self.credentials.get(provider)
+        return credential.secret if credential is not None and credential.provider == provider else None
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -1750,9 +1941,10 @@ class SwarmApplication(Gtk.Application):
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.usage_poll = GLib.timeout_add_seconds(60, self._poll_usage)
-        self._sync_deepseek_key()
-        self.deepseek_key_poll = GLib.timeout_add_seconds(
-            DEEPSEEK_KEY_POLL_SECONDS, self._poll_deepseek_key)
+        if self.deepseek_key_sync is not None:
+            self._sync_deepseek_key()
+            self.deepseek_key_poll = GLib.timeout_add_seconds(
+                DEEPSEEK_KEY_POLL_SECONDS, self._poll_deepseek_key)
 
     def do_shutdown(self):
         if self.deepseek_key_poll:
@@ -1764,9 +1956,13 @@ class SwarmApplication(Gtk.Application):
         self.invalidate_usage("SWARM closed")
         self.invalidate_zai_usage("SWARM closed")
         self.invalidate_deepseek_usage("SWARM closed")
+        self.agent_usage.close()
+        self.credentials.close()
         Gtk.Application.do_shutdown(self)
 
     def _sync_deepseek_key(self):
+        if self.deepseek_key_sync is None:
+            return
         try:
             changed = self.deepseek_key_sync.sync()
         except DeepSeekKeyError as exc:
@@ -1781,6 +1977,7 @@ class SwarmApplication(Gtk.Application):
         if changed:
             self.invalidate_deepseek_usage("DeepSeek key updated. Checking credit…")
             self.refresh_deepseek_usage()
+            self.agent_usage.invalidate("deepseek", implicit_only=True)
             for window in self.get_windows():
                 if isinstance(window, SwarmWindow) and not window.closing:
                     window.flash("DeepSeek key updated. Open a new DeepSeek tab to use it.")
@@ -1815,6 +2012,7 @@ class SwarmApplication(Gtk.Application):
         return ["/bin/sh", "-i"]
 
     def new_window(self, directory=None, *, start_terminal=True):
+        self.configure_agent_usage()
         window = SwarmWindow(self, directory or self.directory)
         if start_terminal:
             window.startup_terminal = window.new_terminal(window.directory)
@@ -1927,12 +2125,14 @@ class SwarmApplication(Gtk.Application):
         self.refresh_usage()
         self.refresh_zai_usage()
         self.refresh_deepseek_usage()
+        self.agent_usage.refresh()
         return GLib.SOURCE_CONTINUE
 
     def sync_usage(self):
         for window in self.get_windows():
             if isinstance(window, SwarmWindow) and not window.closing:
                 window.update_usage()
+        self.sync_agent_usage()
 
     def invalidate_usage(self, status):
         self.usage_generation += 1
@@ -2003,10 +2203,13 @@ class SwarmApplication(Gtk.Application):
         self.sync_zai_usage()
 
     def refresh_zai_usage(self):
+        if "zai" not in self.legacy_usage_agents():
+            return False
         if self.zai_usage_pending:
             return False
         if not any(isinstance(window, SwarmWindow) and not window.closing for window in self.get_windows()):
             return False
+        api_key = self._provider_key("zai")
         self.zai_usage_pending = True
         self.zai_usage_status = "Checking Z.ai usage…"
         self.zai_usage_generation += 1
@@ -2019,7 +2222,7 @@ class SwarmApplication(Gtk.Application):
             snapshot = None
             error = None
             try:
-                snapshot = fetch_zai_usage(cancel=cancel)
+                snapshot = fetch_zai_usage(cancel=cancel, **({"api_key": api_key} if api_key else {}))
             except UsageUnavailable as exc:
                 error = str(exc)
             except Exception:
@@ -2058,10 +2261,13 @@ class SwarmApplication(Gtk.Application):
         self.sync_deepseek_usage()
 
     def refresh_deepseek_usage(self):
+        if "deepseek" not in self.legacy_usage_agents():
+            return False
         if self.deepseek_usage_pending:
             return False
         if not any(isinstance(window, SwarmWindow) and not window.closing for window in self.get_windows()):
             return False
+        api_key = self._provider_key("deepseek")
         self.deepseek_usage_pending = True
         self.deepseek_usage_status = "Checking DeepSeek credit…"
         self.deepseek_usage_generation += 1
@@ -2074,7 +2280,7 @@ class SwarmApplication(Gtk.Application):
             snapshot = None
             error = None
             try:
-                snapshot = fetch_deepseek_usage(cancel=cancel)
+                snapshot = fetch_deepseek_usage(cancel=cancel, **({"api_key": api_key} if api_key else {}))
             except UsageUnavailable as exc:
                 error = str(exc)
             except Exception:

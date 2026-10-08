@@ -216,8 +216,9 @@ def _parse_snapshot(response) -> UsageSnapshot:
     return UsageSnapshot(windows[0] if windows else None, windows[1] if len(windows) > 1 else None)
 
 
-def fetch_zai_usage(timeout: float = 15, cancel: threading.Event | None = None) -> UsageSnapshot:
-    """Read live shared GLM Coding Plan quota, with a bounded, cancellable GET."""
+def fetch_zai_usage(timeout: float = 15, cancel: threading.Event | None = None,
+                    *, api_key: str | None = None) -> UsageSnapshot:
+    """Read shared GLM quota; an explicit key bypasses Hermes credentials."""
     if cancel is not None and cancel.is_set():
         raise UsageUnavailable("Usage refresh cancelled.")
     try:
@@ -227,7 +228,9 @@ def fetch_zai_usage(timeout: float = 15, cancel: threading.Event | None = None) 
     if not valid_timeout:
         raise UsageUnavailable("Usage refresh needs a positive timeout.")
     deadline = time.monotonic() + min(timeout, 60)
-    key = _load_api_key()
+    key = _load_api_key() if api_key is None else _validate_key(api_key)
+    if not key:
+        raise UsageUnavailable("No Z.ai API key supplied.")
     request = json.dumps({"key": key, "timeout": min(timeout, 60)}).encode("utf-8")
     try:
         process = subprocess.Popen(
@@ -250,7 +253,7 @@ def fetch_zai_usage(timeout: float = 15, cancel: threading.Event | None = None) 
             except subprocess.TimeoutExpired:
                 request = None
         if process.returncode == 2:
-            raise UsageUnavailable("Z.ai rejected the Hermes API key. Check your Z.ai sign-in.")
+            raise UsageUnavailable("Z.ai rejected the API key. Check your Z.ai credentials.")
         if process.returncode == 4 or len(output) > MAX_RESPONSE_BYTES:
             raise UsageUnavailable("Z.ai returned an oversized usage response.")
         if process.returncode != 0:

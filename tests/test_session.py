@@ -600,6 +600,25 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(session.error)
         self.assertFalse(session.can_broadcast)
 
+    def test_launch_environment_overrides_only_child_and_preserves_inherited_values(self):
+        session, _directory = self.new_session(start=False)
+        with patch.dict(os.environ, {"SWARM_TEST_INHERITED": "retained", "SWARM_TEST_KEY": "old"}), \
+                patch.object(session.terminal, "spawn_async") as spawn:
+            session.start(["/fake/agent"], environment={"SWARM_TEST_KEY": "new"})
+            child = dict(value.split("=", 1) for value in spawn.call_args.kwargs["envv"])
+            self.assertEqual(child["SWARM_TEST_INHERITED"], "retained")
+            self.assertEqual(child["SWARM_TEST_KEY"], "new")
+            self.assertEqual(os.environ["SWARM_TEST_KEY"], "old")
+            self.assertEqual(spawn.call_args.kwargs["argv"], ["/fake/agent"])
+
+    def test_invalid_launch_environment_never_spawns_or_displays_values(self):
+        session, _directory = self.new_session(start=False)
+        with patch.object(session.terminal, "spawn_async") as spawn:
+            with self.assertRaises(ValueError) as caught:
+                session.start(["/fake/agent"], environment={"KEY": "private-marker\0"})
+            self.assertNotIn("private-marker", str(caught.exception))
+            spawn.assert_not_called()
+
     def test_exit_status_and_no_send_to_exited_process(self):
         session, _directory = self.new_session(mode="exit")
         pump_until(lambda: session.state == "exited")

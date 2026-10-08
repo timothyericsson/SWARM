@@ -25,6 +25,7 @@ from .usage import UsageUnavailable, _close_helper
 
 BALANCE_URL = "https://api.deepseek.com/user/balance"
 MAX_BYTES = 256 * 1024
+_HISTORY_LOCK = threading.Lock()
 
 # Bound DNS, socket reads and response size. Credentials travel via stdin.
 _HTTP_HELPER = r'''
@@ -195,8 +196,8 @@ def _track_balances(balances, available, key, path=None):
         raise UsageUnavailable("Could not save or read DeepSeek balance history.") from exc
 
 
-def fetch_deepseek_usage(timeout=15, cancel: threading.Event | None = None):
-    """Run in a worker; return a live balance and persisted credit percentage."""
+def fetch_deepseek_usage(timeout=15, cancel: threading.Event | None = None, *, api_key=None):
+    """Read a balance; an explicit key bypasses Hermes credential resolution."""
     try:
         valid_timeout = type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0
     except OverflowError:
@@ -207,7 +208,14 @@ def fetch_deepseek_usage(timeout=15, cancel: threading.Event | None = None):
     deadline = time.monotonic() + timeout
     if cancel is not None and cancel.is_set():
         raise UsageUnavailable("Balance refresh cancelled.")
-    key = _load_api_key()
+    if api_key is None:
+        key = _load_api_key()
+    else:
+        if (not isinstance(api_key, str) or not api_key.strip()
+                or len(api_key.strip()) > 4096
+                or any(ord(char) < 33 or ord(char) > 126 for char in api_key.strip())):
+            raise UsageUnavailable("The DeepSeek API key is invalid.")
+        key = api_key.strip()
     request = json.dumps({"key": key, "timeout": timeout}).encode()
     try:
         process = subprocess.Popen([sys.executable, "-c", _HTTP_HELPER], stdin=subprocess.PIPE,
@@ -227,7 +235,7 @@ def fetch_deepseek_usage(timeout=15, cancel: threading.Event | None = None):
             except subprocess.TimeoutExpired:
                 request = None
         if process.returncode == 2:
-            raise UsageUnavailable("DeepSeek rejected the Hermes API key. Check your DeepSeek credentials.")
+            raise UsageUnavailable("DeepSeek rejected the API key. Check your DeepSeek credentials.")
         if process.returncode == 4 or len(output) > MAX_BYTES:
             raise UsageUnavailable("DeepSeek returned an oversized balance response.")
         if process.returncode != 0:
@@ -239,6 +247,14 @@ def fetch_deepseek_usage(timeout=15, cancel: threading.Event | None = None):
         balances, available = _parse_balances(response)
         if cancel is not None and cancel.is_set():
             raise UsageUnavailable("Balance refresh cancelled.")
-        return _track_balances(balances, available, key)
+        # Several saved accounts can refresh together; preserve every account's
+        # previous high-water balance across the shared atomic history update.
+        with _HISTORY_LOCK:
+            return _track_balances(balances, available, key)
+    except OSError as exc:
+        raise UsageUnavailable("Could not read the DeepSeek balance.") from exc
     finally:
-        _close_helper(process)
+        try:
+            _close_helper(process)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise UsageUnavailable("Could not close the DeepSeek balance helper.") from exc

@@ -529,19 +529,30 @@ class TerminalSession(Gtk.Box):
         except Exception:
             _LOG.exception("Broadcast completion callback failed")
 
-    def start(self, argv: list[str]) -> None:
+    def start(self, argv: list[str], *, environment: dict[str, str] | None = None) -> None:
         """Spawn one program directly; shell expansion is deliberately absent."""
         if self._started or self.state == "closed":
             raise RuntimeError("This terminal session has already started or closed.")
         if not argv or not all(isinstance(arg, str) and "\0" not in arg for arg in argv):
             raise ValueError("Provide a valid command and arguments.")
+        envv = None
+        if environment is not None:
+            if not isinstance(environment, dict) or any(
+                not isinstance(name, str) or not name or "=" in name or "\0" in name
+                or not isinstance(value, str) or "\0" in value
+                for name, value in environment.items()
+            ):
+                raise ValueError("Provide valid launch environment variables.")
+            inherited = dict(os.environ)
+            inherited.update(environment)
+            envv = [name + "=" + value for name, value in inherited.items()]
         self._started = True
         try:
             self.terminal.spawn_async(
                 pty_flags=Vte.PtyFlags.DEFAULT,
                 working_directory=self.directory,
                 argv=argv,
-                envv=None,
+                envv=envv,
                 spawn_flags=GLib.SpawnFlags.SEARCH_PATH,
                 child_setup=None,
                 timeout=-1,

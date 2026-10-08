@@ -236,7 +236,7 @@ class WindowTests(unittest.TestCase):
         folder = self.directory / str(len(self.sessions))
         folder.mkdir()
         argv = ["/usr/bin/python3", str(FIXTURE), str(folder), "record"]
-        with patch.object(self.window, "_resolve_startup_command", return_value=(argv, "codex")) as command:
+        with patch.object(self.window, "_resolve_startup_command", return_value=(argv, "codex", {})) as command:
             activated = Gtk.accel_groups_activate(
                 self.window, Gdk.KEY_t, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
         self.assertTrue(activated)

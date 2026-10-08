@@ -15,7 +15,7 @@ From the SWARM source folder, install the desktop dependencies and launch it:
 ./swarm
 ```
 
-The installer refreshes apt package lists and installs Python 3, PyGObject, GTK 3, and VTE. It uses `sudo` when needed and can be run again to ensure the dependencies are installed. Agent CLIs are installed separately.
+The installer refreshes apt package lists and installs Python 3, PyGObject, PyYAML, GTK 3, and VTE. It uses `sudo` when needed and can be run again to ensure the dependencies are installed. Agent CLIs are installed separately.
 
 SWARM uses `/usr/bin/python3` and requires VTE 0.68 or newer. No virtual environment is needed.
 
@@ -44,7 +44,7 @@ Click **Open Swarm** in the titlebar, or choose **Swarm > Open Swarm**, to open 
 
 The initial terminal lets you `cd` to your project before opening a swarm. Once all swarm agents have started, that terminal closes automatically if its shell has no running jobs. Extra terminals you open yourself stay open, and a failed swarm launch keeps the initial terminal available.
 
-Codex tabs launch with `codex --yolo`. This disables Codex command approvals and its sandbox; the agent runs with your user account's permissions. Manually launched Codex keeps the options you supplied. The GLM tab launches with `hermes chat --provider zai --model glm-5.3-flash --yolo`. DeepSeek launches with `hermes chat --provider deepseek --model deepseek-flash --reasoning max --yolo`, selecting the latest V4.1 Flash model with maximum reasoning effort. [DeepSeek’s release notes](https://api-docs.deepseek.com/updates/) report stronger coding-agent results than V4 Pro on several benchmarks. Both Hermes tabs bypass command approval prompts with `--yolo` and use Hermes’s saved credentials and tools; these per-session options leave its saved default model in place. **Actions > Restart Exited Agent** restarts the tab's original harness.
+Codex tabs launch with `codex --yolo`. This disables Codex command approvals and its sandbox; the agent runs with your user account's permissions. Manually launched Codex keeps the options you supplied. The GLM tab launches with `hermes chat --provider zai --model glm-5.3-flash --yolo`. DeepSeek launches with `hermes chat --provider deepseek --model deepseek-flash --reasoning max --yolo`, selecting the latest V4.1 Flash model with maximum reasoning effort. [DeepSeek’s release notes](https://api-docs.deepseek.com/updates/) report stronger coding-agent results than V4 Pro on several benchmarks. Both Hermes tabs bypass command approval prompts with `--yolo` and use the applicable SWARM or Hermes credentials and Hermes tools; these per-session options leave its saved default model in place. **Actions > Restart Exited Agent** restarts the tab's original harness.
 
 Press **Ctrl+T** to open another agent using the selected agent tab's original command and folder, including custom models and harnesses. From a regular terminal or with no agent selected, it opens Codex in the current folder, so you can use `cd` first. **Ctrl+Shift+T** does the same. The shortcut and **Restart Exited Agent** keep the tab's original command even if its startup row has since been edited, disabled, or removed.
 
@@ -82,19 +82,33 @@ Manual sessions can show **Status unavailable** and remain selectable for Custom
 
 All three menus are disabled without running agents. Sleeper Broadcast does not wait for busy agents to finish. If readiness changes during delivery, submission can be cancelled after text was pasted; review the affected prompt.
 
+## API keys
+
+Open **Actions > Add Key…**, paste a key, and choose **Save Key**. SWARM recognizes distinctive OpenAI, Anthropic, OpenRouter, Gemini, Groq, and xAI key prefixes, plus provider environment assignments such as `DEEPSEEK_API_KEY=…`. Detection happens locally. Generic `sk-…` keys do not identify their provider reliably: select **DeepSeek** (or the appropriate provider), or select its startup agent under **Use for**.
+
+Keys can apply to all matching startup agents or to one specific row in **Swarm > Adjust Startup Swarm**. An agent-specific key takes precedence over the provider default. Other supported choices include Z.ai/GLM and Mistral; **Other / custom** lets you supply the environment variable expected by a selected harness. Use the saved-key list to replace or remove keys. New or restarted agents use the new key; existing processes keep their current credentials.
+
+Keys are stored as plaintext in `$XDG_CONFIG_HOME/swarm/credentials.json` (normally `~/.config/swarm/credentials.json`), with owner-only file permissions. They are passed through the child environment and private launch configuration, never process arguments. Hermes launches use the selected key without overwriting the main Hermes profile. A saved OpenAI key selects API authentication for SWARM-launched Codex sessions while preserving the existing ChatGPT login. Without a SWARM key, the harness keeps using its existing authentication.
+
+Assigning a SWARM key to Hermes currently requires a command without `--profile`. Named Hermes profiles and explicit local/custom Codex accounts show **N/A** when SWARM cannot identify the account to track.
+
 ## Account and usage
 
-SWARM reuses Codex's saved sign-in. The Session menu provides ChatGPT and device-code sign-in, plus logout. Logout runs `codex logout` and removes the shared saved login for your operating-system user, including use outside SWARM. Already-running sessions may retain authentication until restarted. Your ChatGPT browser session is separate. These sign-in controls apply only to Codex; configure Hermes authentication in Hermes itself.
+SWARM reuses Codex's saved sign-in. The Session menu provides ChatGPT and device-code sign-in, plus logout. Logout runs `codex logout` and removes the shared saved login for your operating-system user, including use outside SWARM. Already-running sessions may retain authentication until restarted. Your ChatGPT browser session is separate. These sign-in controls apply only to Codex; API keys are managed separately through **Actions > Add Key…**.
+
+The top-left trackers follow the enabled startup agents. Adding a fourth agent adds a badge; changing, disabling, or removing a row updates its tracker. Saving or removing a key refreshes usage for the selected credentials. Extra badges show the agent name and can be scrolled horizontally when space is limited. Agents using the same provider account/key share its usage. Provider detection uses the startup command or your explicit key assignment.
+
+SWARM supports Codex ChatGPT limits, Z.ai Coding Plan quota, DeepSeek credit, and [OpenRouter per-key spending caps](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key). OpenRouter keys without a cap show **N/A** with available spending details. Other providers, custom harnesses, and OpenAI API billing show **N/A**; selecting a provider alone cannot supply a remaining percentage. Click a badge for details and refresh controls. Usage checks do not send model prompts.
 
 The titlebar shows your remaining Codex usage, including accounts with only a weekly limit. Click or hover to see limits, reset times, and remaining usage resets when the CLI reports them. Usage refreshes every minute while signed in and can be refreshed manually. If limits cannot be read, the badge shows no percentage. Reading usage uses Codex's existing authentication and does not send a prompt.
 
-An **orange percentage immediately to its right** shows the Z.ai Coding Plan usage left for **GLM-5.3 Flash in Hermes**. It uses Hermes's saved Z.ai API key and refreshes every minute, independently of Codex sign-in. The percentage follows the shortest model usage window (normally five hours); hover or click to see both that window and the weekly limit, with reset times when reported. Z.ai shares this subscription quota across GLM models. Search and other tool quotas are excluded. Click the badge or its **Refresh** button for an immediate update. Missing credentials or failed requests show **—%** instead of an outdated number. Usage checks only read Z.ai's quota endpoint; they do not send model prompts.
+For the default GLM agent, an **orange percentage** shows Z.ai Coding Plan usage left. It uses the applicable SWARM key, falling back to Hermes's saved Z.ai key, and refreshes every minute independently of Codex sign-in. The percentage follows the shortest model usage window (normally five hours); hover or click to see both that window and the weekly limit, with reset times when reported. Z.ai shares this subscription quota across GLM models. Search and other tool quotas are excluded. Click the badge or its **Refresh** button for an immediate update. Missing credentials or failed requests show **—%** instead of an outdated number.
 
 A **blue percentage to the right of GLM** tracks DeepSeek prepaid API credit. DeepSeek's [balance API](https://api-docs.deepseek.com/api/get-user-balance/) reports current money, without a subscription quota or lifetime deposit total. SWARM shows the current balance as a percentage of the **highest balance it has observed**, separately for each API key and currency. It starts at 100% on the first successful check. Spending reduces it; a balance above the previous high updates the baseline. A top-up below that high increases the percentage without resetting it to 100%. Hover or click to see the actual USD/CNY balance and tracked baseline. This is a credit indicator, not a daily/weekly allowance. It refreshes every minute and clears to **—%** if a request fails. Balance checks do not send model prompts.
 
-Configure `DEEPSEEK_API_KEY` in `~/.hermes/.env` (or your `HERMES_HOME/.env`). Local credential files such as `deepseek.txt` are ignored by Git. SWARM never passes the key in process arguments. Balance baselines are stored under `$XDG_STATE_HOME/swarm/deepseek-balance.json` (normally `~/.local/state/swarm/deepseek-balance.json`), identified by a hash of the key. Keep this file to preserve the baseline across launches. Older Hermes versions may display the compatibility alias `deepseek-v4-flash`; DeepSeek currently routes that alias to V4.1 Flash.
+Add a DeepSeek key through **Actions > Add Key…**. Existing `DEEPSEEK_API_KEY` settings in `~/.hermes/.env` (or your `HERMES_HOME/.env`) remain a fallback until a SWARM key is saved. Balance baselines are stored under `$XDG_STATE_HOME/swarm/deepseek-balance.json` (normally `~/.local/state/swarm/deepseek-balance.json`), identified by a hash of the key. Keep this file to preserve the baseline across launches. Older Hermes versions may display the compatibility alias `deepseek-v4-flash`; DeepSeek currently routes that alias to V4.1 Flash.
 
-SWARM also checks `deepseek.txt` in its source folder at startup and every two seconds while running. Paste a new key into that file, either as a plain `sk-…` key or as `DEEPSEEK_API_KEY=sk-…`; if you append keys, the last key wins. SWARM automatically updates Hermes's `.env`, preserves other settings, and refreshes the blue balance indicator. Missing, empty, or malformed files leave the saved key in place. The `.env` update is atomic and written with owner-only permissions. Open a new DeepSeek tab to use a changed key in an agent; running tabs keep their existing credentials. User-local installations remember the original source file's location. Set `SWARM_DEEPSEEK_KEY_FILE=/absolute/path/to/deepseek.txt` to watch a different file, including with Debian package installations.
+The old `deepseek.txt` watcher is disabled by default. For compatibility, explicitly setting `SWARM_DEEPSEEK_KEY_FILE=/absolute/path/to/deepseek.txt` enables it at startup and every two seconds. That opt-in watcher updates Hermes's `.env`; a key saved through SWARM still takes precedence. Local credential files such as `deepseek.txt` are ignored by Git.
 
 ## Optional installation
 
@@ -145,6 +159,8 @@ Building needs no root access. Remove the package with `sudo apt remove swarm-te
 - `custom_broadcast.py`: recipient picker; `usage.py`: Codex usage queries; `zai_usage.py`: Z.ai Coding Plan usage queries; `deepseek_usage.py`: DeepSeek prepaid balance tracking using Hermes credentials.
 - `deepseek_credentials.py`: automatic `deepseek.txt` synchronization into Hermes credentials.
 - `linked_agents.py` and `linked_agents_dialog.py`: saved startup commands and their configuration window.
+- `credentials.py` and `credentials_dialog.py`: saved provider/agent keys, local detection, and launch authentication.
+- `agent_usage.py` and `provider_usage.py`: dynamic startup-agent badges and provider-specific usage reads.
 - `notifications.py`: desktop completion alerts.
 - `scripts/` and `packaging/`: installation and Debian packaging.
 - `tests/`: terminal fixtures and tests.

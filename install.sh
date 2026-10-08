@@ -34,7 +34,7 @@ as_root() {
 
 printf '%s\n' 'Installing SWARM desktop dependencies...'
 as_root apt-get update
-as_root apt-get install -y python3 python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91
+as_root apt-get install -y python3 python3-gi python3-yaml gir1.2-gtk-3.0 gir1.2-vte-2.91
 
 printf '\n%s\n' \
   'Desktop dependencies installed.' \
