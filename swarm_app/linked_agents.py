@@ -9,7 +9,13 @@ import tempfile
 import unicodedata
 
 
-HARNESS_NAMES = {"codex": "Codex", "hermes": "GLM-5.3 Flash · Hermes",
+GLM_MODEL = "glm-5.3-flash"
+GLM_AGENT_NAME = "GLM-5.3 Flash Thinking · Hermes"
+LEGACY_GLM_AGENT_NAME = "GLM-5.3 Flash · Hermes"
+LEGACY_GLM_COMMAND = "hermes chat --provider zai --model glm-5.3-flash --yolo"
+INVALID_GLM_COMMAND = "hermes chat --provider zai --model glm-5.3-flash-thinking --yolo"
+
+HARNESS_NAMES = {"codex": "Codex", "hermes": GLM_AGENT_NAME,
                  "deepseek": "DeepSeek V4.1 Flash · Hermes"}
 
 
@@ -104,7 +110,8 @@ def agent_command(executable, profile):
         from .activity import codex_agent_command
         return codex_agent_command(executable)
     if profile == "hermes":
-        return [executable, "chat", "--provider", "zai", "--model", "glm-5.3-flash", "--yolo"]
+        return [executable, "chat", "--provider", "zai", "--model", GLM_MODEL,
+                "--reasoning", "max", "--yolo"]
     if profile == "deepseek":
         return [executable, "chat", "--provider", "deepseek", "--model", "deepseek-flash",
                 "--reasoning", "max", "--yolo"]
@@ -160,6 +167,16 @@ class LinkedAgentsSettings:
                     selected.append(StartupAgent(row.get("id"), row.get("name"),
                                                  row.get("command"), row.get("enabled", True)))
                 _validate_agents(selected)
+                current_glm_command = shlex.join(agent_command("hermes", "hermes"))
+                glm_default_commands = {LEGACY_GLM_COMMAND, INVALID_GLM_COMMAND}
+                glm_default_names = {LEGACY_GLM_AGENT_NAME}
+                selected = [
+                    replace(agent,
+                            name=GLM_AGENT_NAME if agent.name in glm_default_names else agent.name,
+                            command=current_glm_command)
+                    if agent.id == "hermes" and agent.command in glm_default_commands else agent
+                    for agent in selected
+                ]
                 hidden = data.get("dont_show_again", False)
                 if type(hidden) is not bool:
                     raise ValueError("Don't show again must be true or false.")

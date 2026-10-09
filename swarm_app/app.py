@@ -781,7 +781,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         return bar
 
     def resolve_codex(self):
-        executable = shutil.which(self.app.codex)
+        executable = self.app.resolve_executable(self.app.codex)
         if executable:
             return str(Path(executable).resolve())
         self.message("Codex CLI was not found",
@@ -831,7 +831,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
             requested = os.path.expanduser(argv[0])
             if "/" in requested and not os.path.isabs(requested):
                 requested = os.path.join(directory, requested)
-            executable = shutil.which(requested)
+            executable = self.app.resolve_executable(requested)
             if executable is None:
                 self.message(f"Could not find the command for {agent.name}",
                              f"{argv[0]} is not executable or is not on your PATH. "
@@ -884,7 +884,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
     def resolve_harness(self, harness):
         if harness == "codex":
             return self.resolve_codex()
-        executable = shutil.which(self.app.hermes)
+        executable = self.app.resolve_executable(self.app.hermes)
         if executable:
             return str(Path(executable).resolve())
         self.message("Hermes CLI was not found",
@@ -1678,7 +1678,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
                      "startup prompts first and leave each harness’s message input empty. Busy sessions handle "
                      "the submitted input according to that harness’s normal behavior.\n\n"
                      "The default Codex command is codex --yolo, with approvals and sandboxing disabled. "
-                     "Default Hermes commands select GLM-5.3 Flash or DeepSeek V4.1 Flash with --yolo. "
+                     "Default Hermes commands select GLM-5.3 Flash or DeepSeek V4.1 Flash with maximum reasoning and --yolo. "
                      "Startup Swarm appears on launch until you save Don't show again. "
                      "Paste images into any broadcast editor to attach them for Codex or Hermes. "
                      "Manually started Codex keeps the options you supplied. "
@@ -1749,6 +1749,8 @@ class SwarmApplication(Gtk.Application):
         self.directory = directory
         self.codex = codex
         self.hermes = hermes
+        self._user_path_lock = threading.Lock()
+        self._user_path_loaded = False
         self.linked_agents = LinkedAgentsSettings(linked_agents_path)
         if credentials_path is None and linked_agents_path is not None:
             credentials_path = Path(linked_agents_path).parent / "credentials.json"
@@ -1784,6 +1786,48 @@ class SwarmApplication(Gtk.Application):
         self.deepseek_key_sync = DeepSeekKeySync(legacy_path) if legacy_path else None
         self.deepseek_key_error = None
         self.deepseek_key_poll = 0
+
+    def resolve_executable(self, command):
+        """Find a command on the desktop PATH or the user's initialized shell PATH."""
+        executable = shutil.which(command)
+        if executable:
+            return executable
+        with self._user_path_lock:
+            if not self._user_path_loaded:
+                self._load_user_shell_path()
+                self._user_path_loaded = True
+        return shutil.which(command)
+
+    def _load_user_shell_path(self):
+        """Add paths configured by the user's shell startup files to this app."""
+        candidates = [os.environ.get("SHELL")]
+        try:
+            candidates.append(pwd.getpwuid(os.getuid()).pw_shell)
+        except (KeyError, OSError):
+            pass
+        marker = "__SWARM_USER_PATH__="
+        command = f"printf '\\n{marker}%s\\n' \"$PATH\""
+        for candidate in dict.fromkeys(path for path in candidates if path):
+            shell = shutil.which(candidate)
+            if not shell:
+                continue
+            shell_name = Path(shell).name
+            mode = "-lic" if shell_name in {"bash", "zsh", "fish", "ksh"} else "-lc"
+            try:
+                result = subprocess.run([shell, mode, command], capture_output=True, text=True,
+                                        timeout=3, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            shell_path = next((line[len(marker):] for line in reversed(result.stdout.splitlines())
+                               if line.startswith(marker)), "")
+            if not shell_path:
+                continue
+            paths = []
+            for path in (shell_path + os.pathsep + os.environ.get("PATH", "")).split(os.pathsep):
+                if path and path not in paths:
+                    paths.append(path)
+            os.environ["PATH"] = os.pathsep.join(paths)
+            return
 
     def set_linked_agent_enabled(self, harness, enabled):
         try:
@@ -2029,7 +2073,7 @@ class SwarmApplication(Gtk.Application):
 
         def check():
             state = None
-            executable = shutil.which(self.codex)
+            executable = self.resolve_executable(self.codex)
             if not executable:
                 status = "Codex not found"
                 state = "missing"

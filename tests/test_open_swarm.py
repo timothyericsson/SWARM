@@ -101,7 +101,7 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual([session.harness for session in sessions], ["codex", "hermes"])
         self.assertEqual([session.kind for session in sessions], ["agent", "agent"])
         self.assertRegex(sessions[0].title, r"^Codex \d+$")
-        self.assertRegex(sessions[1].title, r"^GLM-5.3 Flash · Hermes \d+$")
+        self.assertRegex(sessions[1].title, r"^GLM-5.3 Flash Thinking · Hermes \d+$")
         self.assertTrue(sessions[0].managed_activity_title)
         self.assertFalse(sessions[1].managed_activity_title)
         self.assertEqual(start.call_args_list[0].args,
@@ -128,7 +128,8 @@ class OpenSwarmTests(unittest.TestCase):
         self.assertEqual([s.harness for s in sessions], ["codex", "hermes", "hermes"])
         self.assertEqual({s.directory for s in sessions}, {str(self.directory)})
         self.assertEqual(start.call_args_list[1].args[1],
-                         ["/test/swarm-hermes", "chat", "--provider", "zai", "--model", "glm-5.3-flash", "--yolo"])
+                         ["/test/swarm-hermes", "chat", "--provider", "zai", "--model", "glm-5.3-flash",
+                          "--reasoning", "max", "--yolo"])
         self.assertEqual(start.call_args_list[2].args[1],
                          ["/test/swarm-hermes", "chat", "--provider", "deepseek", "--model", "deepseek-flash",
                           "--reasoning", "max", "--yolo"])
