@@ -351,15 +351,16 @@ class CredentialStore:
         return environment
 
     def _check_hermes_routing(self, original, environment, provider):
-        """Fail safely on endpoint/policy overrides that would change the key's destination."""
+        """Keep managed routing policy intact and isolate local endpoint overrides."""
         if provider == "custom":
-            return
+            return None
         managed = Path(os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes")
         try:
             import yaml
         except ImportError:
             raise CredentialError("Hermes key launches need PyYAML. Install the python3-yaml package.") from None
         try:
+            local_config = None
             for directory in (original, managed):
                 path = directory / "config.yaml"
                 if not path.is_file():
@@ -380,7 +381,16 @@ class CredentialStore:
                     hosts = _HERMES_ENDPOINTS[provider][2]
                     if (parsed.scheme != "https" or parsed.hostname not in hosts
                             or parsed.username or parsed.password or parsed.port not in {None, 443}):
-                        raise CredentialError("Hermes has a different provider endpoint configured. Remove that override or use an agent-specific Other / custom key.")
+                        if directory == managed:
+                            raise CredentialError("Hermes has a different provider endpoint configured in machine-managed settings. Update those settings before assigning a SWARM key.")
+                        # A user's shared Hermes endpoint must not route a
+                        # provider-specific startup row to another backend.
+                        # The launch profile is private, so clear both forms
+                        # there and let the selected provider's environment
+                        # choose its own endpoint. Keep the saved config intact.
+                        config.pop("base_url", None)
+                        model.pop("base_url", None)
+                        local_config = config
                 if model.get("api_key") or model.get("api") or config.get("api_key") or config.get("api"):
                     raise CredentialError("Hermes has a key in config.yaml. Remove that override before assigning a SWARM key.")
             managed_env = managed / ".env"
@@ -395,6 +405,7 @@ class CredentialStore:
             raise
         except (OSError, ValueError, UnicodeError, yaml.YAMLError):
             raise CredentialError("Could not check Hermes provider settings before applying the saved key.") from None
+        return local_config
 
     def _hermes_environment(self, environment, provider):
         """Isolate .env and auth pools while linking the existing profile resources.
@@ -409,12 +420,15 @@ class CredentialStore:
             temporary = tempfile.TemporaryDirectory(prefix=".hermes-launch-", dir=self.path.parent)
             directory = Path(temporary.name)
             original = Path(os.environ.get("HERMES_HOME", "").strip() or Path.home() / ".hermes")
-            self._check_hermes_routing(original, environment, provider)
+            local_config = self._check_hermes_routing(original, environment, provider)
             prior = ""
             auth = {"version": 1, "providers": {}}
             if original.is_dir():
                 for entry in original.iterdir():
-                    if entry.name not in {".env", "auth.json", "auth.lock", "auth.json.lock", "active_profile"}:
+                    excluded = {".env", "auth.json", "auth.lock", "auth.json.lock", "active_profile"}
+                    if local_config is not None:
+                        excluded.add("config.yaml")
+                    if entry.name not in excluded:
                         (directory / entry.name).symlink_to(entry.absolute(), target_is_directory=entry.is_dir())
                 if (original / ".env").is_file():
                     with (original / ".env").open("rb") as stream:
@@ -446,6 +460,10 @@ class CredentialStore:
                     descriptor = os.open(resource, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
                     os.close(descriptor)
                     (directory / name).symlink_to(resource.absolute())
+            if local_config is not None:
+                import yaml
+                (directory / "config.yaml").write_text(yaml.safe_dump(local_config, sort_keys=False),
+                                                       encoding="utf-8")
             selected = "openai-api" if provider == "openai" else provider
             for section in ("providers", "credential_pool", "suppressed_sources"):
                 if isinstance(auth.get(section), dict):
