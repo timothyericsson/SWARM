@@ -25,7 +25,12 @@ def save_broadcast_image(image):
     descriptor, filename = tempfile.mkstemp(prefix="broadcast-", suffix=".png", dir=directory)
     os.close(descriptor)
     try:
-        if not image.savev(filename, "png", [], []):
+        if hasattr(image, "save_to_bufferv"):
+            ok, buffer = image.save_to_bufferv("png", [], [])
+            if not ok:
+                raise OSError("Could not save the attached image.")
+            Path(filename).write_bytes(buffer)
+        elif not image.savev(filename, "png", [], []):
             raise OSError("Could not save the attached image.")
     except Exception:
         Path(filename).unlink(missing_ok=True)
@@ -135,6 +140,11 @@ class ClipboardImageAttachment(Gtk.Box):
     def handle_paste_signal(self, widget):
         if self._text_paste:
             return
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        has_image = (clipboard.wait_is_image_available()
+                     if hasattr(clipboard, "wait_is_image_available") else False)
+        if not has_image:
+            return
         GObject.signal_stop_emission_by_name(widget, "paste-clipboard")
         self.paste_from_clipboard(widget)
 
@@ -142,6 +152,14 @@ class ClipboardImageAttachment(Gtk.Box):
         if self._disposed:
             return
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        has_image = (clipboard.wait_is_image_available()
+                     if hasattr(clipboard, "wait_is_image_available") else True)
+        if not has_image and editor is None:
+            self._notice = "No image found on the clipboard"
+            self._show_status()
+            self._on_change()
+            return
+
         self._request_id += 1
         request_id = self._request_id
         self._requests[request_id] = _PasteRequest(editor)
@@ -149,10 +167,19 @@ class ClipboardImageAttachment(Gtk.Box):
         self._show_status()
         self._on_change()
         request = (self._generation, request_id)
+        GLib.timeout_add(3000, self._request_timeout, request)
         try:
             clipboard.request_image(self._image_received, request)
         except (GLib.Error, RuntimeError):
             self._complete_request(request, error="Could not read the clipboard image")
+
+    def _request_timeout(self, request):
+        generation, request_id = request
+        if not self._disposed and generation == self._generation and request_id in self._requests:
+            pending = self._requests[request_id]
+            if not pending.complete:
+                self._complete_request(request, error="Could not read the clipboard image")
+        return GLib.SOURCE_REMOVE
 
     def _attach_clicked(self, *_args):
         self.paste_from_clipboard()

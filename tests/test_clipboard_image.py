@@ -187,6 +187,31 @@ class ClipboardImageTests(unittest.TestCase):
                 save_broadcast_image(BrokenImage())
             self.assertEqual(list(Path(folder).rglob("*.png")), [])
 
+    def test_text_paste_does_not_intercept_or_enter_pending_state(self):
+        self.clipboard.set_text("hello clipboard", -1)
+        self.editor.emit("paste-clipboard")
+        pump_until(lambda: self.text() == "hello clipboard")
+        self.assertFalse(self.widget.pending)
+        self.assertEqual(self.widget.images, [])
+
+    def test_attach_button_with_no_image_shows_notice_without_pending(self):
+        self.clipboard.set_text("not an image", -1)
+        self.widget.attach_button.clicked()
+        self.assertFalse(self.widget.pending)
+        self.assertIn("No image found", self.widget.status.get_text())
+
+    def test_paste_timeout_clears_pending_and_displays_error(self):
+        clipboard = SimpleNamespace(
+            request_image=Mock(),
+            wait_is_image_available=Mock(return_value=True),
+        )
+        with patch("swarm_app.clipboard_image.Gtk.Clipboard.get", return_value=clipboard):
+            self.widget.attach_button.clicked()
+            self.assertTrue(self.widget.pending)
+            self.widget._request_timeout((self.widget._generation, self.widget._request_id))
+            self.assertFalse(self.widget.pending)
+            self.assertIn("Could not read", self.widget.status.get_text())
+
 
 if __name__ == "__main__":
     unittest.main()
