@@ -303,6 +303,7 @@ class SwarmWindow(Gtk.ApplicationWindow):
         self.credentials_dialog = None
         self.agent_usage_badges = {}
         self.custom_selection = {}
+        self._menu_copy_text = None
         self.broadcast_watches = []
         self.flash_source = 0
         self.last_states = {}
@@ -761,7 +762,13 @@ class SwarmWindow(Gtk.ApplicationWindow):
         item(actions, "_Restart Exited Agent", self.restart_current)
 
         edit = menu("_Edit")
-        item(edit, "_Copy", self.copy, "<Primary><Shift>c")
+        edit.connect("map", self._capture_copy_selection)
+        edit.connect("selection-done", self._clear_copy_selection)
+        copy_item = item(edit, "_Copy", lambda: self._copy_text(self._menu_copy_text))
+        # Shortcuts read the live selection even after a menu was cancelled.
+        key, mods = Gtk.accelerator_parse("<Primary><Shift>c")
+        copy_item.get_child().set_accel(key, mods)
+        self.accels.connect(key, mods, Gtk.AccelFlags.VISIBLE, self._copy_shortcut)
         item(edit, "_Paste", self.paste, "<Primary><Shift>v")
         item(edit, "Select _All", lambda: self.with_terminal(lambda terminal: terminal.select_all()))
 
@@ -1597,7 +1604,26 @@ class SwarmWindow(Gtk.ApplicationWindow):
             callback(self.current().terminal)
 
     def copy(self):
-        self.with_terminal(lambda terminal: terminal.copy_clipboard_format(Vte.Format.TEXT))
+        self.with_terminal(lambda terminal: self._copy_text(terminal.get_text_selected(Vte.Format.TEXT)))
+
+    def _copy_shortcut(self, *_):
+        self.copy()
+        return True
+
+    def _capture_copy_selection(self, _menu):
+        session = self.current()
+        self._menu_copy_text = (session.terminal.get_text_selected(Vte.Format.TEXT) or "") if session else ""
+
+    def _clear_copy_selection(self, _menu):
+        # selection-done follows activation; unmap happens before it.
+        self._menu_copy_text = None
+
+    def _copy_text(self, text):
+        if not text:
+            self.flash("Select terminal text to copy")
+            return
+        # GTK owns the text so it remains available if the terminal is closed.
+        self.get_clipboard(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
 
     def paste(self):
         self.with_terminal(lambda terminal: terminal.paste_clipboard())
@@ -1605,15 +1631,20 @@ class SwarmWindow(Gtk.ApplicationWindow):
     def _terminal_menu(self, terminal, event):
         if event.button != 3:
             return False
+        # Live output can clear VTE's selection while the menu is open.
+        selected_text = terminal.get_text_selected(Vte.Format.TEXT)
         menu = Gtk.Menu()
+        menu.connect("selection-done", lambda menu: menu.destroy())
         for title, callback in (
-            ("Copy", lambda: terminal.copy_clipboard_format(Vte.Format.TEXT)),
+            ("Copy", lambda: self._copy_text(selected_text)),
             ("Paste", lambda: terminal.paste_clipboard()),
             ("Global Broadcast…", self.open_broadcast),
         ):
             item = Gtk.MenuItem(label=title)
             item.connect("activate", lambda _item, fn=callback: fn())
-            if title.startswith("Global"):
+            if title == "Copy":
+                item.set_sensitive(bool(selected_text))
+            elif title.startswith("Global"):
                 item.set_sensitive(bool(self.active_agents()))
             menu.append(item)
         menu.show_all()

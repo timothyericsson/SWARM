@@ -611,6 +611,109 @@ class WindowTests(unittest.TestCase):
         finally:
             menu.destroy()
 
+    def test_context_copy_keeps_selected_text_when_terminal_redraws(self):
+        session, _ = self.add()
+        session.terminal.feed("Selected café 日本語\x1b]0;Before redraw\x07".encode())
+        pump_until(lambda: session.terminal.get_window_title() == "Before redraw")
+        session.terminal.select_all()
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text("Previous clipboard contents", -1)
+        self.addCleanup(clipboard.clear)
+        menus = []
+        with patch.object(Gtk.Menu, "popup_at_pointer", lambda menu, _event: menus.append(menu)):
+            self.window._terminal_menu(session.terminal, SimpleNamespace(button=3))
+        menu = menus[0]
+        try:
+            self.assertEqual(clipboard.wait_for_text(), "Previous clipboard contents")
+            session.terminal.feed(b"\r\x1b[2KReplacement text\x1b]0;After redraw\x07")
+            pump_until(lambda: session.terminal.get_window_title() == "After redraw")
+            self.assertFalse(session.terminal.get_has_selection())
+            menu.get_children()[0].activate()
+            self.assertEqual(clipboard.wait_for_text(), "Selected café 日本語\n")
+        finally:
+            menu.destroy()
+
+    def test_copy_without_selection_preserves_clipboard(self):
+        session, _ = self.add()
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text("Keep this clipboard text", -1)
+        self.addCleanup(clipboard.clear)
+        self.window.copy()
+        self.assertEqual(clipboard.wait_for_text(), "Keep this clipboard text")
+        menus = []
+        with patch.object(Gtk.Menu, "popup_at_pointer", lambda menu, _event: menus.append(menu)):
+            self.window._terminal_menu(session.terminal, SimpleNamespace(button=3))
+        menu = menus[0]
+        try:
+            self.assertFalse(menu.get_children()[0].get_sensitive())
+            self.assertEqual(clipboard.wait_for_text(), "Keep this clipboard text")
+        finally:
+            menu.destroy()
+
+    def test_copy_shortcut_preserves_text_after_source_terminal_is_destroyed(self):
+        session, _ = self.add()
+        session.terminal.feed("Copy café 日本語\x1b]0;Copy ready\x07".encode())
+        pump_until(lambda: session.terminal.get_window_title() == "Copy ready")
+        session.terminal.select_all()
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self.addCleanup(clipboard.clear)
+        key, modifiers = Gtk.accelerator_parse("<Primary><Shift>c")
+        self.assertTrue(Gtk.accel_groups_activate(self.window, key, modifiers))
+        self.assertEqual(clipboard.wait_for_text(), "Copy café 日本語\n")
+        self.window.close_session(session, confirm=False)
+        self.assertEqual(clipboard.wait_for_text(), "Copy café 日本語\n")
+
+    def test_edit_menu_copy_keeps_selected_text_when_terminal_redraws(self):
+        session, _ = self.add()
+        session.terminal.feed("Edit menu café 日本語\x1b]0;Edit selection ready\x07".encode())
+        pump_until(lambda: session.terminal.get_window_title() == "Edit selection ready")
+        session.terminal.select_all()
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text("Previous clipboard contents", -1)
+        self.addCleanup(clipboard.clear)
+        menu_bar = self.window.get_child().get_children()[0]
+        edit = next(item for item in menu_bar.get_children() if item.get_label() == "_Edit")
+        self.click_widget(edit)
+        pump_until(edit.get_submenu().get_mapped)
+        self.assertEqual(clipboard.wait_for_text(), "Previous clipboard contents")
+        session.terminal.feed(b"\r\x1b[2KReplacement text\x1b]0;Edit selection replaced\x07")
+        pump_until(lambda: session.terminal.get_window_title() == "Edit selection replaced")
+        self.assertFalse(session.terminal.get_has_selection())
+        self.native_input("key", "Down", "Return")
+        pump_until(lambda: not edit.get_submenu().get_mapped())
+        self.assertEqual(clipboard.wait_for_text(), "Edit menu café 日本語\n")
+
+    def test_copy_shortcut_uses_fresh_selection_after_dismissing_edit_menu(self):
+        session, _ = self.add()
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self.addCleanup(clipboard.clear)
+        menu_bar = self.window.get_child().get_children()[0]
+        edit = next(item for item in menu_bar.get_children() if item.get_label() == "_Edit")
+        view = next(item for item in menu_bar.get_children() if item.get_label() == "_View")
+        for dismissal in ("escape", "switch menu"):
+            with self.subTest(dismissal=dismissal):
+                session.terminal.feed(
+                    f"\r\x1b[2KOld selection\x1b]0;Old {dismissal}\x07".encode())
+                pump_until(lambda: session.terminal.get_window_title() == f"Old {dismissal}")
+                session.terminal.select_all()
+                self.click_widget(edit)
+                pump_until(edit.get_submenu().get_mapped)
+                if dismissal == "switch menu":
+                    self.native_input("key", "Right")
+                    pump_until(view.get_submenu().get_mapped)
+                    self.native_input("key", "Escape")
+                    pump_until(lambda: not view.get_submenu().get_mapped())
+                else:
+                    self.native_input("key", "Escape")
+                pump_until(lambda: not edit.get_submenu().get_mapped())
+                session.terminal.feed(
+                    f"\r\x1b[2KFresh selection\x1b]0;Fresh {dismissal}\x07".encode())
+                pump_until(lambda: session.terminal.get_window_title() == f"Fresh {dismissal}")
+                session.terminal.select_all()
+                clipboard.set_text("Previous clipboard contents", -1)
+                self.native_input("key", "ctrl+shift+c")
+                pump_until(lambda: clipboard.wait_for_text() == "Fresh selection\n")
+
     def native_input(self, *args):
         if (shutil.which("xdotool") is None
                 or Gdk.Display.get_default().__gtype__.name != "GdkX11Display"):

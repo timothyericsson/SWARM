@@ -17,7 +17,7 @@ From the SWARM source folder, install the desktop dependencies and launch it:
 
 The installer refreshes apt package lists and installs Python 3, PyGObject, PyYAML, GTK 3, and VTE. It uses `sudo` when needed and can be run again to ensure the dependencies are installed. Agent CLIs are installed separately.
 
-SWARM uses `/usr/bin/python3` and requires VTE 0.68 or newer. No virtual environment is needed.
+SWARM uses `/usr/bin/python3` and requires VTE 0.70 or newer. No virtual environment is needed.
 
 The first terminal starts in your home folder. To choose another folder or custom executable paths:
 
